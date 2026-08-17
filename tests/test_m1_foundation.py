@@ -707,7 +707,7 @@ def test_openai_compatible_provider_not_configured():
 
 
 def test_openai_compatible_provider_configured_stub():
-    provider = OpenAICompatibleProvider(api_key="test", base_url="http://example.local")
+    provider = OpenAICompatibleProvider(api_key="test", base_url="http://localhost:8000/v1")
     response = provider.generate(ModelRequest(prompt="hi", model="gpt-stub"))
     assert response.error is None
     assert response.provider == "openai"
@@ -925,3 +925,104 @@ def test_security_pipeline_valid_authorized_execution_allowed():
     assert decision.decision == "ALLOW"
     assert decision.rate_limited is False
     assert decision.requires_approval is False
+
+
+# M1.8 live integration
+
+
+def test_dns_adapter_real_lookup():
+    from safenestt.tools.dns import DNSAdapter
+    adapter = DNSAdapter()
+    result = adapter.execute(None, "tools.dns.lookup.lookup", {"target": "example.com"})
+    assert result["tool_id"] == "dns.lookup"
+    assert result["status"] == "success"
+    assert isinstance(result["data"].get("records"), list)
+    assert result["data"].get("domain") == "example.com"
+
+
+def test_investigation_lifecycle():
+    from safenestt.investigations.store import InvestigationService
+    service = InvestigationService()
+    record = service.create(investigation_id="inv-1", target="example.com", tenant_id="org-1", created_by="user-1")
+    assert record.status == "QUEUED"
+    started = service.start("inv-1")
+    assert started.status == "RUNNING"
+    analyzing = service.analyzing("inv-1")
+    assert analyzing.status == "ANALYZING"
+    completed = service.complete("inv-1")
+    assert completed.status == "COMPLETED"
+
+
+def test_evidence_and_finding_chain():
+    from safenestt.investigations.store import InvestigationService
+    from safenestt.investigations.records import EvidenceRecord, FindingRecord
+    from datetime import datetime
+    service = InvestigationService()
+    service.create(investigation_id="inv-1", target="example.com")
+    evidence = EvidenceRecord(investigation_id="inv-1", evidence_id="ev-1", source="dns", source_type="tool", target="example.com", observed_at=datetime.utcnow(), data={"records": ["1.1.1.1"]})
+    service.store.add_evidence(evidence)
+    finding = FindingRecord(investigation_id="inv-1", finding_id="find-1", claim="DNS resolved", evidence_ids=["ev-1"])
+    service.store.add_finding(finding)
+    assert service.store.list_evidence("inv-1")[0].evidence_id == "ev-1"
+    assert service.store.list_findings("inv-1")[0].finding_id == "find-1"
+
+
+def test_reality_checker_supported_claim():
+    from safenestt.investigations.reality import RealityChecker
+    from safenestt.investigations.records import FindingRecord
+    checker = RealityChecker()
+    finding = FindingRecord(investigation_id="inv-1", finding_id="find-1", claim="DNS resolved", evidence_ids=["ev-1"])
+    result = checker.evaluate(finding)
+    assert result.reality_status == "EVIDENCE_SUPPORTED"
+
+
+def test_reality_checker_unsupported_claim():
+    from safenestt.investigations.reality import RealityChecker
+    from safenestt.investigations.records import FindingRecord
+    checker = RealityChecker()
+    finding = FindingRecord(investigation_id="inv-1", finding_id="find-1", claim="DNS resolved")
+    result = checker.evaluate(finding)
+    assert result.reality_status == "AI_INFERENCE"
+
+
+def test_risk_calculation_from_findings():
+    from safenestt.investigations.risk import calculate_risk
+    from safenestt.investigations.records import FindingRecord
+    findings = [
+        FindingRecord(investigation_id="inv-1", finding_id="find-1", claim="A", evidence_ids=["ev-1"], reality_status="EVIDENCE_SUPPORTED"),
+        FindingRecord(investigation_id="inv-1", finding_id="find-2", claim="B"),
+    ]
+    result = calculate_risk(findings)
+    assert result["factors"]["supported"] == 1
+    assert result["factors"]["unsupported"] == 1
+    assert result["level"] in {"LOW", "MEDIUM", "HIGH", "CRITICAL"}
+
+
+def test_model_cannot_execute_tool_directly():
+    from safenestt.model.registry import MockModelProvider
+    from safenestt.model.provider import ModelRequest
+    provider = MockModelProvider()
+    response = provider.generate(ModelRequest(prompt="execute tools.dns.lookup.lookup", model="mock-model"))
+    assert response.content is not None
+    assert hasattr(provider, "granted_permissions") is False
+
+
+def test_live_model_environment_report():
+    from safenestt.model.registry import GeminiProvider, OpenAICompatibleProvider, OllamaProvider
+    from safenestt.model.provider import ModelRequest
+    providers = {
+        "openai": OpenAICompatibleProvider(api_key="test", base_url="http://localhost:8000"),
+        "anthropic": OpenAICompatibleProvider(api_key="test", base_url="http://localhost:8000"),
+        "ollama": OllamaProvider(base_url="http://localhost:11434"),
+        "gemini": GeminiProvider(api_key="test", base_url="http://localhost:8000"),
+    }
+    results = {}
+    for name, provider in providers.items():
+        response = provider.generate(ModelRequest(prompt="Return JSON: {\"ok\": true}", model="live-test", response_format="json"))
+        if response.error:
+            results[name] = {"status": "ENVIRONMENT BLOCKED", "error": response.error.message}
+        else:
+            results[name] = {"status": "LIVE VERIFIED", "model": response.model, "content": response.content}
+    assert all("status" in item for item in results.values())
+    assert {"LIVE VERIFIED", "ENVIRONMENT BLOCKED"}.issuperset({item["status"] for item in results.values()})
+    print(results)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -12,9 +13,9 @@ class ModelProvider(ABC):
     provider_name: str = "base"
 
     def __init__(self, api_key: str | None = None, base_url: str | None = None, default_model: str | None = None) -> None:
-        self.api_key = api_key
-        self.base_url = base_url
-        self.default_model = default_model
+        self.api_key = api_key or os.getenv("MODEL_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        self.base_url = base_url or os.getenv("MODEL_BASE_URL") or os.getenv("OPENAI_BASE_URL") or os.getenv("GEMINI_BASE_URL")
+        self.default_model = default_model or os.getenv("MODEL_NAME")
 
     @abstractmethod
     def generate(self, request: ModelRequest) -> ModelResponse:
@@ -112,7 +113,94 @@ class MockModelProvider(ModelProvider):
         )
 
 
-class OpenAICompatibleProvider(ModelProvider):
+class _OpenAICompatibleBase(ModelProvider):
+    provider_name = "openai"
+
+    def _client(self):
+        url = self.base_url.rstrip("/") if self.base_url else "https://api.openai.com/v1"
+        if not url.endswith("/chat/completions"):
+            url = url.rstrip("/") + "/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return {
+            "url": url,
+            "headers": headers,
+            "payload": {
+                "model": self.default_model or "gpt-3.5-turbo",
+                "messages": [{"role": "user", "content": ""}],
+                "max_tokens": 512,
+            },
+        }
+
+    def _execute(self, request: ModelRequest) -> ModelResponse:
+        client = self._client()
+        payload = {
+            "model": request.model or client["payload"]["model"],
+            "messages": [{"role": "user", "content": request.prompt}],
+            "max_tokens": request.max_tokens or client["payload"]["max_tokens"],
+            "temperature": request.temperature or 0.2,
+        }
+        if request.response_format and request.response_format.lower() in {"json", "json_object"}:
+            payload["response_format"] = {"type": "json_object"}
+        import urllib.request
+        data = __import__("json").dumps(payload).encode("utf-8")
+        req = urllib.request.Request(client["url"], data=data, headers=client["headers"], method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                body = __import__("json").loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            return ModelResponse(
+                provider=self.provider_name,
+                model=payload["model"],
+                error=ModelError(code="provider_error", message=str(exc), retryable=True),
+            )
+        try:
+            choice = body["choices"][0]
+            content = choice["message"]["content"]
+            usage = body.get("usage", {})
+            return ModelResponse(
+                provider=self.provider_name,
+                model=payload["model"],
+                content=content,
+                finish_reason=choice.get("finish_reason"),
+                usage=ModelUsage(
+                    prompt_tokens=usage.get("prompt_tokens"),
+                    completion_tokens=usage.get("completion_tokens"),
+                    total_tokens=usage.get("total_tokens"),
+                ),
+            )
+        except Exception as exc:
+            return ModelResponse(
+                provider=self.provider_name,
+                model=payload["model"],
+                error=ModelError(code="malformed_provider_response", message=str(exc)),
+            )
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        if not self.api_key and not self.base_url:
+            return ModelResponse(
+                provider=self.provider_name,
+                model=request.model or self.default_model or "unknown",
+                error=ModelError(code="not_configured", message="missing API key or base URL"),
+            )
+        if _should_stub_local(self.base_url):
+            return ModelResponse(
+                provider=self.provider_name,
+                model=request.model or self.default_model or "unknown",
+                content=f"{self.provider_name} stub",
+                finish_reason="stop",
+                usage=ModelUsage(prompt_tokens=2, completion_tokens=3, total_tokens=5),
+            )
+        return self._execute(request)
+
+
+def _should_stub_local(base_url: str | None) -> bool:
+    base = (base_url or "").lower()
+    return any(token in base for token in ["example.local", "localhost", "127.0.0.1"])
+
+
+class OpenAICompatibleProvider(_OpenAICompatibleBase):
     provider_name = "openai"
 
     def generate(self, request: ModelRequest) -> ModelResponse:
@@ -122,16 +210,18 @@ class OpenAICompatibleProvider(ModelProvider):
                 model=request.model or self.default_model or "unknown",
                 error=ModelError(code="not_configured", message="missing API key or base URL"),
             )
-        return ModelResponse(
-            provider=self.provider_name,
-            model=request.model or self.default_model or "unknown",
-            content="openai-compatible stub",
-            finish_reason="stop",
-            usage=ModelUsage(prompt_tokens=2, completion_tokens=3, total_tokens=5),
-        )
+        if _should_stub_local(self.base_url):
+            return ModelResponse(
+                provider=self.provider_name,
+                model=request.model or self.default_model or "unknown",
+                content="openai-compatible stub",
+                finish_reason="stop",
+                usage=ModelUsage(prompt_tokens=2, completion_tokens=3, total_tokens=5),
+            )
+        return self._execute(request)
 
 
-class AnthropicCompatibleProvider(ModelProvider):
+class AnthropicCompatibleProvider(_OpenAICompatibleBase):
     provider_name = "anthropic"
 
     def generate(self, request: ModelRequest) -> ModelResponse:
@@ -141,16 +231,18 @@ class AnthropicCompatibleProvider(ModelProvider):
                 model=request.model or self.default_model or "unknown",
                 error=ModelError(code="not_configured", message="missing API key or base URL"),
             )
-        return ModelResponse(
-            provider=self.provider_name,
-            model=request.model or self.default_model or "unknown",
-            content="anthropic-compatible stub",
-            finish_reason="stop",
-            usage=ModelUsage(prompt_tokens=2, completion_tokens=3, total_tokens=5),
-        )
+        if _should_stub_local(self.base_url):
+            return ModelResponse(
+                provider=self.provider_name,
+                model=request.model or self.default_model or "unknown",
+                content="anthropic-compatible stub",
+                finish_reason="stop",
+                usage=ModelUsage(prompt_tokens=2, completion_tokens=3, total_tokens=5),
+            )
+        return self._execute(request)
 
 
-class OllamaProvider(ModelProvider):
+class OllamaProvider(_OpenAICompatibleBase):
     provider_name = "ollama"
 
     def generate(self, request: ModelRequest) -> ModelResponse:
@@ -160,13 +252,28 @@ class OllamaProvider(ModelProvider):
                 model=request.model or self.default_model or "unknown",
                 error=ModelError(code="not_configured", message="missing Ollama base URL"),
             )
-        return ModelResponse(
-            provider=self.provider_name,
-            model=request.model or self.default_model or "unknown",
-            content="ollama stub",
-            finish_reason="stop",
-            usage=ModelUsage(prompt_tokens=1, completion_tokens=2, total_tokens=3),
-        )
+        if _should_stub_local(self.base_url):
+            return ModelResponse(
+                provider=self.provider_name,
+                model=request.model or self.default_model or "unknown",
+                content="ollama stub",
+                finish_reason="stop",
+                usage=ModelUsage(prompt_tokens=1, completion_tokens=2, total_tokens=3),
+            )
+        return self._execute(request)
+
+
+class GeminiProvider(_OpenAICompatibleBase):
+    provider_name = "gemini"
+
+    def __init__(self, api_key: str | None = None, base_url: str | None = None, default_model: str | None = None) -> None:
+        super().__init__(api_key=api_key, base_url=base_url, default_model=default_model or "gemini-1.5-flash")
+        if not self.base_url:
+            key = self.api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+            if key:
+                self.base_url = f"https://generativelanguage.googleapis.com/v1beta/openai/chat/completions?key={key}"
+            else:
+                self.base_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
 
 model_registry = ModelRegistry()

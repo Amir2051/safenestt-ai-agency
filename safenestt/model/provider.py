@@ -5,22 +5,6 @@ from typing import Any
 
 
 @dataclass
-class ModelUsage:
-    prompt_tokens: int | None = None
-    completion_tokens: int | None = None
-    total_tokens: int | None = None
-    raw: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class ModelError:
-    code: str
-    message: str
-    detail: str | None = None
-    raw: dict[str, Any] | None = None
-
-
-@dataclass
 class ModelResponse:
     provider: str
     model: str
@@ -33,20 +17,43 @@ class ModelResponse:
 
 
 @dataclass
+class ModelUsage:
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+
+
+@dataclass
+class ModelError:
+    code: str
+    message: str
+    retryable: bool = False
+
+
+@dataclass
 class ModelRequest:
     prompt: str
     model: str | None = None
     temperature: float | None = None
     max_tokens: int | None = None
-    structured: bool = False
+    response_format: str | None = None
     metadata: dict[str, Any] | None = None
 
 
-@dataclass
-class ModelProviderConfig:
-    provider: str
-    model: str | None = None
-    api_key: str | None = None
-    base_url: str | None = None
-    temperature: float | None = None
-    max_tokens: int | None = None
+class ModelProvider:
+    provider_name: str = "base"
+
+    def __init__(self, api_key: str | None = None, base_url: str | None = None, default_model: str | None = None) -> None:
+        self.api_key = api_key
+        self.base_url = base_url
+        self.default_model = default_model
+
+    def health_check(self) -> ModelResponse:
+        configured = bool(self.api_key or self.base_url)
+        return ModelResponse(
+            provider=self.provider_name,
+            model=self.default_model or "unknown",
+            content="configured" if configured else "not_configured",
+            finish_reason="health",
+            warnings=[] if configured else ["provider_not_configured"],
+        )
