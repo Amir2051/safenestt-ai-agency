@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import pytest
 
-from safenestt.registry import AgentRecord, AgentRegistry, AgentStatus, RiskLevel, agent_registry
-from safenestt.orchestrator import Task, TaskStatus, Orchestrator
+from safenestt.registry import AgentRecord, AgentRegistry, AgentStatus, RiskLevel
+from safenestt.orchestrator import Orchestrator, Task, TaskStatus
 from safenestt.security.audit import AuditEvent, AuditLogger, audit
 from safenestt.security.permissions import AuthorizationDecision, PermissionManager, permission_manager
 from safenestt.security.redaction import redact
-from safenestt.security.isolation import production_isolation_check, assert_path_under_safenestt_ai
+from safenestt.security.isolation import assert_path_under_safenestt_ai, production_isolation_check
 from safenestt.tools.interface import Adapter, ToolInterface
+from safenestt.tools.manifest import ToolManifest, default_tool_manifest
+from safenestt.tools.mocks import MockDocumentLookupResult, MockIdentityLookupResult, MockURLAnalysisResult, MockWebSearchResult, ProviderFailure, ProviderTimeout, mock_provider_failure, mock_provider_malformed, mock_provider_timeout
+from safenestt.tools.registry import ToolRegistry, tool_registry
+from safenestt.tools.result import ToolResult
 from safenestt.memory.provider import MemoryRecord, StubMemoryProvider, memory_provider
 
 
@@ -366,8 +370,8 @@ def test_tool_interface_denies_without_permission():
     tool = ToolInterface(pm)
     decision = tool.execute(None, "tools.web.search", {"query": "test"})
     assert decision["decision"] == "DENY"
-    assert decision["reason"] == "missing_agent"
-    assert "tool_contract" not in decision
+    assert decision["reason"] == "missing_manifest"
+    assert "result" not in decision
 
 
 def test_tool_interface_never_calls_adapter_on_deny():
@@ -381,26 +385,27 @@ def test_tool_interface_never_calls_adapter_on_deny():
             self.calls += 1
             return {"ok": True}
 
-    tool = ToolInterface(pm, CallRecorder())
-    decision = tool.execute(None, "tools.web.search", {"query": "test"})
+    tool = ToolInterface(pm)
+    decision = tool.execute(None, "tools.web.search", {"query": "test"}, adapter=CallRecorder())
     assert decision["decision"] == "DENY"
-    assert decision["reason"] == "missing_agent"
+    assert decision["reason"] == "missing_manifest"
 
 
 def test_tool_interface_returns_structured_authorization_decision():
     pm = PermissionManager()
-    pm.granted_permissions["a1"] = {"tools.web.search"}
+    pm.granted_permissions["a1"] = {"tools.web.search.search"}
+    manifest = ToolManifest(tool_id="web.search", name="Web Search", description="", provider="mock", actions=["search"], enabled=True, risk_level="LOW")
 
     class ResultAdapter:
         def execute(self, agent, capability, payload):
             return {"ok": True}
 
-    tool = ToolInterface(pm, ResultAdapter())
-    decision = tool.execute(FakeAgentRecord("a1", ["tools.web.search"], RiskLevel.LOW), "tools.web.search", {"query": "ok"})
+    tool = ToolInterface(pm)
+    decision = tool.execute(FakeAgentRecord("a1", ["tools.web.search.search"], RiskLevel.LOW), "tools.web.search.search", {"query": "ok"}, manifest=manifest, adapter=ResultAdapter())
     assert decision["decision"] == "ALLOW"
     assert decision["approval_required"] is False
     assert decision["approval_id"] is None
-    assert "tool_contract" in decision
+    assert "result" in decision
 
 
 # Redaction
@@ -446,3 +451,202 @@ def test_stub_memory_provider():
     provider.add(record)
     results = provider.query("a1", "task")
     assert results == [record]
+
+
+# Tool manifest / registry / interface
+
+
+def test_tool_manifest_unknown_tool_rejected():
+    registry = ToolRegistry()
+    manifest = ToolManifest(tool_id="web.search", name="Web Search", description="", provider="mock", actions=["search"], enabled=True)
+    registry.register(manifest)
+    tool = ToolInterface()
+    decision = tool.validate(manifest, "tools.other.search", {"query": "x"})
+    assert decision.decision == "DENY"
+    assert decision.reason == "unknown_tool"
+
+
+def test_tool_manifest_unknown_action_rejected():
+    registry = ToolRegistry()
+    manifest = ToolManifest(tool_id="web.search", name="Web Search", description="", provider="mock", actions=["search"], enabled=True)
+    registry.register(manifest)
+    tool = ToolInterface()
+    decision = tool.validate(manifest, "tools.web.search.lookup", {"query": "x"})
+    assert decision.decision == "DENY"
+    assert decision.reason == "unknown_action"
+
+
+def test_tool_manifest_disabled_tool_rejected():
+    registry = ToolRegistry()
+    manifest = ToolManifest(tool_id="web.search", name="Web Search", description="", provider="mock", actions=["search"], enabled=False)
+    registry.register(manifest)
+    tool = ToolInterface()
+    decision = tool.validate(manifest, "tools.web.search.search", {"query": "x"})
+    assert decision.decision == "DENY"
+    assert decision.reason == "tool_disabled"
+
+
+def test_tool_registry_duplicate_rejected():
+    registry = ToolRegistry()
+    registry.register(ToolManifest(tool_id="web.search", name="Web Search", description="", provider="mock", actions=["search"]))
+    with pytest.raises(ValueError):
+        registry.register(ToolManifest(tool_id="web.search", name="Web Search 2", description="", provider="mock", actions=["search"]))
+
+
+def test_tool_interface_unknown_tool_denies():
+    pm = PermissionManager()
+    pm.granted_permissions["a1"] = {"tools.web.search.search"}
+    tool = ToolInterface(pm)
+    decision = tool.execute(FakeAgentRecord("a1", ["tools.web.search.search"], RiskLevel.LOW), "tools.web.search.search", {"query": "x"})
+    assert decision["decision"] == "DENY"
+    assert decision["reason"] == "missing_manifest"
+
+
+def test_tool_interface_disabled_tool_denies():
+    pm = PermissionManager()
+    pm.granted_permissions["a1"] = {"tools.web.search.search"}
+    manifest = ToolManifest(tool_id="web.search", name="Web Search", description="", provider="mock", actions=["search"], enabled=False)
+    tool = ToolInterface(pm)
+    decision = tool.execute(FakeAgentRecord("a1", ["tools.web.search.search"], RiskLevel.LOW), "tools.web.search.search", {"query": "x"}, manifest=manifest)
+    assert decision["decision"] == "DENY"
+    assert decision["reason"] == "tool_disabled"
+
+
+def test_tool_interface_invalid_arguments_deny():
+    pm = PermissionManager()
+    pm.granted_permissions["a1"] = {"tools.web.search.search"}
+    manifest = ToolManifest(tool_id="web.search", name="Web Search", description="", provider="mock", actions=["search"], enabled=True, risk_level="LOW")
+    tool = ToolInterface(pm)
+    decision = tool.execute(FakeAgentRecord("a1", ["tools.web.search.search"], RiskLevel.LOW), "tools.web.search.search", None, manifest=manifest)
+    assert decision["decision"] == "DENY"
+    assert decision["reason"] == "invalid_arguments"
+
+
+def test_tool_interface_authorized_execution():
+    pm = PermissionManager()
+    pm.granted_permissions["a1"] = {"tools.web.search.search"}
+    manifest = ToolManifest(tool_id="web.search", name="Web Search", description="", provider="mock", actions=["search"], enabled=True, risk_level="LOW")
+    tool = ToolInterface(pm)
+
+    class WebAdapter:
+        def execute(self, agent, capability, payload):
+            return MockWebSearchResult(query=payload.get("query", "")).to_tool_result()
+
+    result = tool.execute(FakeAgentRecord("a1", ["tools.web.search.search"], RiskLevel.LOW), "tools.web.search.search", {"query": "x"}, manifest=manifest, adapter=WebAdapter())
+    assert result["decision"] == "ALLOW"
+    assert result["tool_id"] == "web.search"
+    assert result["result"]["data"]["query"] == "x"
+
+
+def test_tool_interface_unauthorized_execution():
+    pm = PermissionManager()
+    manifest = ToolManifest(tool_id="web.search", name="Web Search", description="", provider="mock", actions=["search"], enabled=True, risk_level="LOW")
+    tool = ToolInterface(pm)
+    result = tool.execute(None, "tools.web.search.search", {"query": "x"}, manifest=manifest, adapter=MockWebSearchResult(query="x"))
+    assert result["decision"] == "DENY"
+    assert result["reason"] == "missing_agent"
+
+
+def test_tool_interface_approval_required_never_executes_adapter():
+    pm = PermissionManager()
+    pm.granted_permissions["a1"] = {"tools.shell.execute"}
+    manifest = ToolManifest(tool_id="shell", name="Shell", description="", provider="mock", actions=["execute"], enabled=True, risk_level="HIGH")
+
+    class CallRecorder:
+        def __init__(self):
+            self.calls = 0
+        def execute(self, agent, capability, payload):
+            self.calls += 1
+            return {"ok": True}
+
+    tool = ToolInterface(pm, adapter=CallRecorder())
+    result = tool.execute(FakeAgentRecord("a1", ["tools.shell.execute"], RiskLevel.HIGH), "tools.shell.execute", {"command": "ls"}, manifest=manifest)
+    assert result["decision"] == "DENY"
+    assert result["reason"] == "approval_required"
+
+
+def test_tool_interface_approval_gated_execution():
+    pm = PermissionManager()
+    pm.granted_permissions["a1"] = {"tools.shell.execute"}
+    manifest = ToolManifest(tool_id="shell", name="Shell", description="", provider="mock", actions=["execute"], enabled=True, risk_level="HIGH")
+    tool = ToolInterface(pm)
+    pm.record_approval("approval-a1-tools.shell.execute", True)
+    result = tool.execute(FakeAgentRecord("a1", ["tools.shell.execute"], RiskLevel.HIGH), "tools.shell.execute", {"command": "ls"}, manifest=manifest, adapter=MockWebSearchResult(query="ls"))
+    assert result["decision"] == "ALLOW"
+    assert result["tool_id"] == "shell"
+    assert result["approval_required"] is True
+
+
+def test_tool_interface_provider_failure():
+    pm = PermissionManager()
+    pm.granted_permissions["a1"] = {"tools.web.search.search"}
+    manifest = ToolManifest(tool_id="web.search", name="Web Search", description="", provider="mock", actions=["search"], enabled=True, risk_level="LOW")
+    tool = ToolInterface(pm)
+    result = tool.execute(FakeAgentRecord("a1", ["tools.web.search.search"], RiskLevel.LOW), "tools.web.search.search", {"query": "x"}, manifest=manifest, adapter=mock_provider_failure)
+    assert result["decision"] == "ALLOW"
+    assert result["result"]["status"] == "error"
+    assert result["result"]["error"] == "mock provider failure"
+
+
+def test_tool_interface_provider_timeout():
+    pm = PermissionManager()
+    pm.granted_permissions["a1"] = {"tools.web.search.search"}
+    manifest = ToolManifest(tool_id="web.search", name="Web Search", description="", provider="mock", actions=["search"], enabled=True, risk_level="LOW")
+    tool = ToolInterface(pm)
+    result = tool.execute(FakeAgentRecord("a1", ["tools.web.search.search"], RiskLevel.LOW), "tools.web.search.search", {"query": "x"}, manifest=manifest, adapter=mock_provider_timeout)
+    assert result["decision"] == "ALLOW"
+    assert result["result"]["status"] == "error"
+
+
+def test_tool_interface_malformed_provider_result():
+    pm = PermissionManager()
+    pm.granted_permissions["a1"] = {"tools.web.search.search"}
+    manifest = ToolManifest(tool_id="web.search", name="Web Search", description="", provider="mock", actions=["search"], enabled=True, risk_level="LOW")
+    tool = ToolInterface(pm)
+    result = tool.execute(FakeAgentRecord("a1", ["tools.web.search.search"], RiskLevel.LOW), "tools.web.search.search", {"query": "x"}, manifest=manifest, adapter=mock_provider_malformed)
+    assert result["decision"] == "ALLOW"
+    assert result["result"]["status"] == "error"
+    assert result["result"]["error"] == "malformed_provider_response"
+
+
+def test_tool_interface_structured_tool_result():
+    pm = PermissionManager()
+    pm.granted_permissions["a1"] = {"tools.web.search.search"}
+    manifest = ToolManifest(tool_id="web.search", name="Web Search", description="", provider="mock", actions=["search"], enabled=True, risk_level="LOW")
+    tool = ToolInterface(pm)
+    result = tool.execute(FakeAgentRecord("a1", ["tools.web.search.search"], RiskLevel.LOW), "tools.web.search.search", {"query": "x"}, manifest=manifest, adapter=MockWebSearchResult(query="x"))
+    assert result["result"]["tool_id"] == "web.search"
+    assert result["result"]["action"] == "tools.web.search.search"
+    assert result["result"]["status"] == "success"
+    assert "data" in result["result"]
+    assert "metadata" in result["result"]
+
+
+def test_tool_interface_redacts_provider_metadata():
+    pm = PermissionManager()
+    pm.granted_permissions["a1"] = {"tools.web.search.search"}
+    manifest = ToolManifest(tool_id="web.search", name="Web Search", description="", provider="mock", actions=["search"], enabled=True, risk_level="LOW")
+    tool = ToolInterface(pm)
+
+    class SecretAdapter:
+        def execute(self, agent, capability, payload):
+            return {"status": "success", "data": {}, "metadata": {"api_key": "secret"}}
+
+    result = tool.execute(FakeAgentRecord("a1", ["tools.web.search.search"], RiskLevel.LOW), "tools.web.search.search", {"query": "x"}, manifest=manifest, adapter=SecretAdapter())
+    assert result["result"]["metadata"] == {"api_key": "[REDACTED]"}
+
+
+def test_tool_manifest_cannot_lower_risk():
+    manifest = ToolManifest(tool_id="high.tool", name="High", description="", provider="mock", actions=["run"], enabled=True, risk_level="LOW")
+    pm = PermissionManager()
+    pm.granted_permissions["a1"] = {"tools.high.tool.run"}
+    decision = pm.authorize(FakeAgentRecord("a1", ["tools.high.tool.run"], RiskLevel.CRITICAL), "tools.high.tool.run")
+    assert decision.risk == RiskLevel.CRITICAL
+
+
+def test_tool_manifest_requires_valid_registration():
+    registry = ToolRegistry()
+    manifest = ToolManifest(tool_id="web.search", name="Web Search", description="", provider="mock", actions=["search"])
+    registry.register(manifest)
+    assert registry.get("web.search") is manifest
+    assert registry.get("missing") is None
