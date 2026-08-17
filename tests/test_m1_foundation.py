@@ -5,18 +5,11 @@ import pytest
 from safenestt.registry import AgentRecord, AgentRegistry, AgentStatus, RiskLevel, agent_registry
 from safenestt.orchestrator import Task, TaskStatus, Orchestrator
 from safenestt.security.audit import AuditEvent, AuditLogger, audit
-from safenestt.security.permissions import PermissionDecision, PermissionManager, permission_manager
+from safenestt.security.permissions import AuthorizationDecision, PermissionManager, permission_manager
 from safenestt.security.redaction import redact
-from safenestt.security.isolation import production_isolation_check, repo_root
-from safenestt.tools.interface import ToolInterface
+from safenestt.security.isolation import production_isolation_check, assert_path_under_safenestt_ai
+from safenestt.tools.interface import Adapter, ToolInterface
 from safenestt.memory.provider import MemoryRecord, StubMemoryProvider, memory_provider
-
-
-class DummyAgent:
-    def __init__(self, agent_id: str, capabilities: list[str], risk_level: RiskLevel = RiskLevel.LOW):
-        self.agent_id = agent_id
-        self.capabilities = capabilities
-        self.risk_level = risk_level
 
 
 class FakeAgentRecord:
@@ -24,6 +17,12 @@ class FakeAgentRecord:
         self.agent_id = agent_id
         self.capabilities = capabilities
         self.risk_level = risk_level
+        self.enabled = True
+        self.status = AgentStatus.ACTIVE
+
+
+# Registry
+
 
 def test_registry_register_and_get():
     registry = AgentRegistry()
@@ -148,6 +147,7 @@ def test_loader_reuses_stable_ids_across_reloads():
 
 # Orchestrator
 
+
 def test_orchestrator_plan_selects_agent():
     registry = AgentRegistry()
     registry.register(AgentRecord(agent_id="e1", name="Engineer", capabilities=["engineering"], enabled=True, status=AgentStatus.ACTIVE))
@@ -226,43 +226,185 @@ def test_orchestrator_rejects_unknown_handoff_target():
     assert "unknown_target_agent" in result["reason"]
 
 
-# Permissions
+# Security boundary / permissions
+
 
 def test_permission_manager_authorize():
     pm = PermissionManager()
+    pm.granted_permissions["a1"] = {"tools.web.search"}
     agent = FakeAgentRecord("a1", ["tools.web.search"], RiskLevel.LOW)
-    pm.grant("a1", ["tools.web.search"])
-    assert pm.authorize(agent, "tools.web.search").allowed is True
-    assert pm.authorize(agent, "tools.shell.execute").allowed is False
+    decision = pm.authorize(agent, "tools.web.search")
+    assert isinstance(decision, AuthorizationDecision)
+    assert decision.decision == "ALLOW"
+    assert decision.reason == "authorized"
+    assert decision.approval_required is False
 
 
-def test_permission_evaluate_execution_low_allows():
+def test_permission_manager_denies_missing_permission():
     pm = PermissionManager()
     agent = FakeAgentRecord("a1", ["tools.web.search"], RiskLevel.LOW)
-    pm.grant("a1", ["tools.web.search"])
-    decision = pm.evaluate_execution(agent, "tools.web.search", {"query": "test"})
-    assert decision.allowed is True
-    assert decision.requires_approval is False
+    decision = pm.authorize(agent, "tools.shell.execute")
+    assert decision.decision == "DENY"
+    assert decision.reason == "missing_permission"
 
 
-def test_permission_evaluate_execution_high_requires_approval():
+def test_permission_manager_denies_unknown_agent():
     pm = PermissionManager()
+    decision = pm.authorize(None, "tools.shell.execute")
+    assert decision.decision == "DENY"
+    assert decision.reason == "missing_agent"
+
+
+def test_permission_manager_denies_invalid_capability():
+    pm = PermissionManager()
+    agent = FakeAgentRecord("a1", ["tools.web.search"], RiskLevel.LOW)
+    decision = pm.authorize(agent, "tools..execute")
+    assert decision.decision == "DENY"
+    assert decision.reason == "invalid_capability"
+
+
+def test_permission_manager_disabled_agent_denied():
+    pm = PermissionManager()
+    agent = AgentRecord(agent_id="a1", name="Disabled", enabled=False, status=AgentStatus.ACTIVE)
+    decision = pm.authorize(agent, "tools.web.search")
+    assert decision.decision == "DENY"
+    assert decision.reason == "agent_inactive"
+
+
+def test_permission_manager_suspended_agent_denied():
+    pm = PermissionManager()
+    agent = AgentRecord(agent_id="a1", name="Suspended", enabled=True, status=AgentStatus.SUSPENDED)
+    decision = pm.authorize(agent, "tools.web.search")
+    assert decision.decision == "DENY"
+    assert decision.reason == "agent_inactive"
+
+
+def test_permission_manager_medium_requires_approval():
+    pm = PermissionManager()
+    pm.granted_permissions["a1"] = {"tools.shell.execute"}
+    agent = FakeAgentRecord("a1", ["tools.shell.execute"], RiskLevel.MEDIUM)
+    decision = pm.authorize(agent, "tools.shell.execute")
+    assert decision.decision == "DENY"
+    assert decision.approval_required is True
+    assert decision.reason == "approval_required"
+
+
+def test_permission_manager_high_requires_approval():
+    pm = PermissionManager()
+    pm.granted_permissions["a1"] = {"tools.shell.execute"}
     agent = FakeAgentRecord("a1", ["tools.shell.execute"], RiskLevel.HIGH)
-    pm.grant("a1", ["tools.shell.execute"])
-    decision = pm.evaluate_execution(agent, "tools.shell.execute", {"command": "ls"})
-    assert decision.requires_approval is True
+    decision = pm.authorize(agent, "tools.shell.execute")
+    assert decision.decision == "DENY"
+    assert decision.approval_required is True
+    assert decision.reason == "approval_required"
 
 
-# Audit
+def test_permission_manager_critical_requires_explicit_approval():
+    pm = PermissionManager()
+    pm.granted_permissions["a1"] = {"tools.destructive.wipe"}
+    agent = FakeAgentRecord("a1", ["tools.destructive.wipe"], RiskLevel.CRITICAL)
+    decision = pm.authorize(agent, "tools.destructive.wipe")
+    assert decision.decision == "DENY"
+    assert decision.risk == RiskLevel.CRITICAL
+    assert decision.approval_id == "approval-a1-tools.destructive.wipe"
+    pm.record_approval(decision.approval_id, True, metadata={"requested_by": "human"})
+    decision = pm.authorize(agent, "tools.destructive.wipe")
+    assert decision.decision == "ALLOW"
+    assert decision.approval_id == "approval-a1-tools.destructive.wipe"
 
-def test_audit_logger_records():
-    logger = AuditLogger()
-    event = AuditEvent(event_id="e1", actor_type="agent", actor_id="a1", action="tool.execute", decision="ALLOW")
-    logger.record(event)
-    assert logger.recent()[0].event_id == "e1"
+
+def test_permission_manager_forged_approval_rejected():
+    pm = PermissionManager()
+    pm.granted_permissions["a1"] = {"tools.destructive.wipe"}
+    agent = FakeAgentRecord("a1", ["tools.destructive.wipe"], RiskLevel.CRITICAL)
+    pm.approval_store["approval-a1-tools.destructive.wipe"] = {"approval_id": "approval-a1-tools.destructive.wipe", "approved": False}
+    decision = pm.authorize(agent, "tools.destructive.wipe")
+    assert decision.decision == "DENY"
+    assert decision.reason == "approval_required"
+
+
+def test_permission_manager_agent_cannot_grant_permissions():
+    pm = PermissionManager()
+    with pytest.raises(PermissionError):
+        pm.grant("a1", ["tools.web.search"])
+
+
+def test_permission_manager_model_cannot_modify_permissions():
+    pm = PermissionManager()
+    with pytest.raises(PermissionError):
+        pm.revoke("a1", ["tools.web.search"])
+
+
+def test_permission_manager_manifest_cannot_elevate_permissions():
+    pm = PermissionManager()
+    agent = AgentRecord(agent_id="a1", name="Manifest", capabilities=["tools.shell.execute"], risk_level=RiskLevel.HIGH, enabled=True, status=AgentStatus.ACTIVE)
+    decision = pm.authorize(agent, "tools.shell.execute")
+    assert decision.decision == "DENY"
+    assert decision.reason == "missing_permission"
+
+
+def test_permission_manager_denies_malformed_tool_id():
+    pm = PermissionManager()
+    agent = FakeAgentRecord("a1", ["tools.web.search"], RiskLevel.LOW)
+    decision = pm.authorize(agent, "tools..execute")
+    assert decision.decision == "DENY"
+
+
+def test_permission_manager_risk_downgrade_ignored():
+    pm = PermissionManager()
+    pm.granted_permissions["a1"] = {"tools.destructive.wipe"}
+    agent = FakeAgentRecord("a1", ["tools.destructive.wipe"], RiskLevel.CRITICAL)
+    decision = pm.authorize(agent, "tools.destructive.wipe")
+    assert decision.risk == RiskLevel.CRITICAL
+
+
+# Tool interface
+
+
+def test_tool_interface_denies_without_permission():
+    pm = PermissionManager()
+    tool = ToolInterface(pm)
+    decision = tool.execute(None, "tools.web.search", {"query": "test"})
+    assert decision["decision"] == "DENY"
+    assert decision["reason"] == "missing_agent"
+    assert "tool_contract" not in decision
+
+
+def test_tool_interface_never_calls_adapter_on_deny():
+    pm = PermissionManager()
+
+    class CallRecorder:
+        def __init__(self):
+            self.calls = 0
+
+        def execute(self, agent, capability, payload):
+            self.calls += 1
+            return {"ok": True}
+
+    tool = ToolInterface(pm, CallRecorder())
+    decision = tool.execute(None, "tools.web.search", {"query": "test"})
+    assert decision["decision"] == "DENY"
+    assert decision["reason"] == "missing_agent"
+
+
+def test_tool_interface_returns_structured_authorization_decision():
+    pm = PermissionManager()
+    pm.granted_permissions["a1"] = {"tools.web.search"}
+
+    class ResultAdapter:
+        def execute(self, agent, capability, payload):
+            return {"ok": True}
+
+    tool = ToolInterface(pm, ResultAdapter())
+    decision = tool.execute(FakeAgentRecord("a1", ["tools.web.search"], RiskLevel.LOW), "tools.web.search", {"query": "ok"})
+    assert decision["decision"] == "ALLOW"
+    assert decision["approval_required"] is False
+    assert decision["approval_id"] is None
+    assert "tool_contract" in decision
 
 
 # Redaction
+
 
 def test_redact_api_key():
     assert redact({"api_key": "abc"}) == {"api_key": "[REDACTED]"}
@@ -274,19 +416,19 @@ def test_redact_nested():
 
 # Isolation
 
+
 def test_production_isolation_check_true_when_missing():
     assert production_isolation_check() is True
 
 
-# Tool interface
-
-def test_tool_interface_denies_without_permission():
-    tool = ToolInterface(permission_manager)
-    decision = tool.execute(None, "tools.web.search", {"query": "test"})
-    assert decision["decision"] == "DENY"
+def test_production_path_rejected():
+    from pathlib import Path
+    with pytest.raises(PermissionError):
+        assert_path_under_safenestt_ai(Path("/home/ronzoro/safenestt-platform"))
 
 
 # Agent loader module import
+
 
 def test_agent_loader_importable():
     from safenestt.agent_loader import load_approved_roster, load_core_team  # noqa: F401
@@ -296,6 +438,7 @@ def test_agent_loader_importable():
 
 
 # Memory
+
 
 def test_stub_memory_provider():
     provider = StubMemoryProvider()

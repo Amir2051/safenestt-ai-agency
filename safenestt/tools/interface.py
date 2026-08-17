@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from safenestt.registry import AgentRecord, AgentStatus, RiskLevel, agent_registry
-from safenestt.security.permissions import PermissionManager
+from safenestt.registry import AgentRecord, RiskLevel
+from safenestt.security.permissions import AuthorizationDecision, PermissionManager
 
 
 def default_tool_contract() -> dict[str, Any]:
@@ -22,15 +22,35 @@ def default_tool_contract() -> dict[str, Any]:
     }
 
 
+class Adapter:
+    def execute(self, agent: AgentRecord | None, capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        raise RuntimeError("adapter must not execute denied requests")
+
+
 class ToolInterface:
-    def __init__(self, permission_manager: PermissionManager | None = None) -> None:
+    def __init__(self, permission_manager: PermissionManager | None = None, adapter: Adapter | None = None) -> None:
         self.permission_manager = permission_manager or PermissionManager()
+        self.adapter = adapter or Adapter()
+
+    def authorize(self, agent: AgentRecord | None, capability: str, payload: dict[str, Any] | None = None) -> AuthorizationDecision:
+        return self.permission_manager.authorize(agent, capability)
 
     def execute(self, agent: AgentRecord | None, capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        decision = self.permission_manager.evaluate_execution(agent, capability, payload)
-        if not decision.allowed or decision.requires_approval:
-            return {"decision": "DENY" if not decision.allowed else "REQUIRE_APPROVAL", "reason": decision.reason, "risk_level": decision.risk_level.value}
-        return {"decision": "ALLOW", "tool_contract": default_tool_contract()}
+        decision = self.permission_manager.authorize(agent, capability)
+        response = {
+            "decision": decision.decision,
+            "reason": decision.reason,
+            "agent_id": decision.agent_id,
+            "tool_id": decision.tool_id,
+            "action": decision.action,
+            "risk": decision.risk.value,
+            "required_permission": decision.required_permission,
+            "approval_required": decision.approval_required,
+            "approval_id": decision.approval_id,
+        }
+        if decision.decision != "ALLOW":
+            return response
+        return response | {"tool_contract": default_tool_contract(), "result": self.adapter.execute(agent, capability, payload)}
 
 
 tool_interface = ToolInterface()
