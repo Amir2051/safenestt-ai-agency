@@ -28,6 +28,10 @@ from safenestt.model.registry import (
     OllamaProvider,
     model_registry,
 )
+from safenestt.security.approval import ApprovalService
+from safenestt.security.audit_persistent import AuditService
+from safenestt.security.rate_limit import RateLimitService
+from safenestt.security.pipeline import SecurityPipeline
 
 
 class FakeAgentRecord:
@@ -774,3 +778,150 @@ def test_model_provider_does_not_modify_permissions():
     except Exception:
         pass
     assert "gpt-stub" not in pm.granted_permissions
+
+
+# Approval persistence
+
+
+def test_approval_service_request_and_lookup():
+    service = ApprovalService()
+    record = service.request(agent_id="a1", tool_id="web.search", action="search", requested_capability="tools.web.search.search", risk_level="LOW")
+    assert record.status == "pending"
+    assert service.is_approved(record.approval_id) is False
+
+
+def test_approval_service_approve_and_reject():
+    service = ApprovalService()
+    record = service.request(agent_id="a1", tool_id="web.search", action="search", requested_capability="tools.web.search.search", risk_level="LOW")
+    approved = service.record_decision(record.approval_id, True)
+    assert approved.status == "approved"
+    assert service.is_approved(record.approval_id) is True
+
+
+def test_approval_service_reject_blocks_execution():
+    service = ApprovalService()
+    record = service.request(agent_id="a1", tool_id="web.search", action="search", requested_capability="tools.web.search.search", risk_level="LOW")
+    service.record_decision(record.approval_id, False)
+    assert service.is_approved(record.approval_id) is False
+
+
+def test_approval_service_cancel_blocks_execution():
+    service = ApprovalService()
+    record = service.request(agent_id="a1", tool_id="web.search", action="search", requested_capability="tools.web.search.search", risk_level="LOW")
+    assert service.repository.cancel(record.approval_id) is not None
+    assert service.is_approved(record.approval_id) is False
+
+
+def test_approval_service_expired_approval_rejected():
+    from datetime import datetime, timedelta
+    service = ApprovalService()
+    record = service.request(agent_id="a1", tool_id="web.search", action="search", requested_capability="tools.web.search.search", risk_level="LOW", expiration_at=datetime.utcnow() - timedelta(minutes=1))
+    service.record_decision(record.approval_id, True)
+    assert service.is_approved(record.approval_id) is False
+
+
+def test_approval_service_cross_tenant_rejected():
+    service = ApprovalService()
+    record = service.request(agent_id="a1", tool_id="web.search", action="search", requested_capability="tools.web.search.search", risk_level="LOW", organization_id="org-1")
+    service.record_decision(record.approval_id, True)
+    assert service.is_approved(record.approval_id, organization_id="org-1") is True
+    assert service.is_approved(record.approval_id, organization_id="org-2") is False
+
+
+# Audit persistence
+
+
+def test_audit_service_records_redacted_event():
+    service = AuditService()
+    event = service.record("org-1", actor_type="agent", actor_id="a1", action="tool.execute", decision="DENY", risk="LOW", metadata={"api_key": "secret"})
+    assert event.metadata["api_key"] == "[REDACTED]"
+
+
+def test_audit_service_append_behavior_is_immutable():
+    service = AuditService()
+    first = service.record("org-1", actor_type="agent", actor_id="a1", action="tool.execute", decision="DENY", risk="LOW")
+    second = service.record("org-1", actor_type="agent", actor_id="a1", action="tool.execute", decision="ALLOW", risk="LOW")
+    recent = service.repository.recent(organization_id="org-1")
+    assert len(recent) == 2
+    assert recent[0].event_id == first.event_id
+    assert recent[1].event_id == second.event_id
+
+
+def test_audit_service_cross_tenant_isolation():
+    service = AuditService()
+    service.record("org-1", actor_type="agent", actor_id="a1", action="tool.execute", decision="DENY", risk="LOW")
+    service.record("org-2", actor_type="agent", actor_id="a1", action="tool.execute", decision="DENY", risk="LOW")
+    org1_events = service.repository.recent(organization_id="org-1")
+    assert len(org1_events) == 1
+    assert org1_events[0].organization_id == "org-1"
+
+
+# Rate limiting
+
+
+def test_rate_limiter_allows_under_limit():
+    service = RateLimitService()
+    result = service.enforce("tool", "web.search", limit=2, window_seconds=60)
+    assert result.allowed is True
+    assert result.remaining == 1
+
+
+def test_rate_limiter_denies_over_limit():
+    service = RateLimitService()
+    service.enforce("tool", "web.search", limit=1, window_seconds=60)
+    result = service.enforce("tool", "web.search", limit=1, window_seconds=60)
+    assert result.allowed is False
+    assert result.remaining == 0
+
+
+def test_rate_limiter_reset_restores_limit():
+    service = RateLimitService()
+    service.enforce("tool", "web.search", limit=1, window_seconds=1)
+    result = service.enforce("tool", "web.search", limit=1, window_seconds=1)
+    assert result.allowed is False
+
+
+# Security pipeline
+
+
+def test_security_pipeline_denies_without_permission():
+    pipeline = SecurityPipeline()
+    decision = pipeline.authorize(None, "tools.web.search.search", organization_id="org-1")
+    assert decision.decision == "DENY"
+    assert decision.rate_limited is False
+
+
+def test_security_pipeline_denies_pending_approval():
+    pipeline = SecurityPipeline()
+    pm = pipeline.permission_manager
+    pm.granted_permissions["a1"] = {"tools.shell.execute"}
+    approval = pipeline.approval_service.request(agent_id="a1", tool_id="shell", action="execute", requested_capability="tools.shell.execute", risk_level="HIGH", organization_id="org-1")
+    pm.record_approval(approval.approval_id, True, metadata={"requested_by": "human"})
+    decision = pipeline.authorize(FakeAgentRecord("a1", ["tools.shell.execute"], RiskLevel.HIGH), "tools.shell.execute", organization_id="org-1", tool_id="shell")
+    assert decision.decision == "DENY"
+    assert decision.reason == "approval_required"
+
+
+def test_security_pipeline_rate_limited_blocks_execution():
+    pipeline = SecurityPipeline()
+    pipeline.rate_limit_service.enforce("tool", "a1:tools.web.search.search", limit=0, window_seconds=60)
+    decision = pipeline.authorize(FakeAgentRecord("a1", ["tools.web.search.search"], RiskLevel.LOW), "tools.web.search.search", organization_id="org-1", tool_id="web.search")
+    assert decision.decision == "DENY"
+    assert decision.rate_limited is True
+
+
+def test_security_pipeline_disabled_agent_denied():
+    pipeline = SecurityPipeline()
+    agent = AgentRecord(agent_id="a1", name="Disabled", enabled=False, status=AgentStatus.ACTIVE)
+    decision = pipeline.authorize(agent, "tools.web.search.search", organization_id="org-1", tool_id="web.search")
+    assert decision.decision == "DENY"
+
+
+def test_security_pipeline_valid_authorized_execution_allowed():
+    pipeline = SecurityPipeline()
+    pm = pipeline.permission_manager
+    pm.granted_permissions["a1"] = {"tools.web.search.search"}
+    decision = pipeline.authorize(FakeAgentRecord("a1", ["tools.web.search.search"], RiskLevel.LOW), "tools.web.search.search", organization_id="org-1", tool_id="web.search")
+    assert decision.decision == "ALLOW"
+    assert decision.rate_limited is False
+    assert decision.requires_approval is False
