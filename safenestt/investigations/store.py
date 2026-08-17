@@ -93,6 +93,34 @@ class InvestigationService:
         record.mark("ANALYZING")
         return self.store.update_investigation(record)
 
+    def waiting(self, investigation_id: str) -> InvestigationRecord | None:
+        record = self.store.get_investigation(investigation_id)
+        if not record:
+            return None
+        record.mark("WAITING_FOR_TOOL")
+        return self.store.update_investigation(record)
+
+    def verifying(self, investigation_id: str) -> InvestigationRecord | None:
+        record = self.store.get_investigation(investigation_id)
+        if not record:
+            return None
+        record.mark("VERIFYING")
+        return self.store.update_investigation(record)
+
+    def calculating_risk(self, investigation_id: str) -> InvestigationRecord | None:
+        record = self.store.get_investigation(investigation_id)
+        if not record:
+            return None
+        record.mark("CALCULATING_RISK")
+        return self.store.update_investigation(record)
+
+    def cancel(self, investigation_id: str) -> InvestigationRecord | None:
+        record = self.store.get_investigation(investigation_id)
+        if not record:
+            return None
+        record.mark("CANCELLED")
+        return self.store.update_investigation(record)
+
     def list_evidence(self, investigation_id: str) -> list[EvidenceRecord]:
         return self.store.list_evidence(investigation_id)
 

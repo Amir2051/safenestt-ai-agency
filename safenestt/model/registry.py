@@ -197,7 +197,7 @@ class _OpenAICompatibleBase(ModelProvider):
 
 def _should_stub_local(base_url: str | None) -> bool:
     base = (base_url or "").lower()
-    return any(token in base for token in ["example.local", "localhost", "127.0.0.1"])
+    return "example.local" in base
 
 
 class OpenAICompatibleProvider(_OpenAICompatibleBase):
