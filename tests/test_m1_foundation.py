@@ -14,6 +14,20 @@ from safenestt.tools.mocks import MockDocumentLookupResult, MockIdentityLookupRe
 from safenestt.tools.registry import ToolRegistry, tool_registry
 from safenestt.tools.result import ToolResult
 from safenestt.memory.provider import MemoryRecord, StubMemoryProvider, memory_provider
+from safenestt.model.registry import (
+    AnthropicCompatibleProvider,
+    ModelError,
+    ModelProvider,
+    ModelProviderConfig,
+    ModelRegistry,
+    ModelRequest,
+    ModelResponse,
+    ModelUsage,
+    MockModelProvider,
+    OpenAICompatibleProvider,
+    OllamaProvider,
+    model_registry,
+)
 
 
 class FakeAgentRecord:
@@ -650,3 +664,113 @@ def test_tool_manifest_requires_valid_registration():
     registry.register(manifest)
     assert registry.get("web.search") is manifest
     assert registry.get("missing") is None
+
+
+# Model provider abstraction
+
+
+def test_mock_model_provider_generates_deterministic_response():
+    provider = MockModelProvider()
+    request = ModelRequest(prompt="test prompt", model="mock-model")
+    response = provider.generate(request)
+    assert response.provider == "mock"
+    assert response.model == "mock-model"
+    assert "test prompt" in (response.content or "")
+    assert response.usage.total_tokens == 12
+
+
+def test_mock_model_provider_custom_response():
+    provider = MockModelProvider()
+    provider.responses["mock-model:custom"] = {"content": "custom", "structured_data": {"ok": True}, "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+    response = provider.generate(ModelRequest(prompt="custom", model="mock-model"))
+    assert response.content == "custom"
+    assert response.structured_data == {"ok": True}
+    assert response.usage.total_tokens == 2
+
+
+def test_mock_model_provider_health_check():
+    provider = MockModelProvider()
+    response = provider.health_check()
+    assert response.provider == "mock"
+    assert response.content == "configured"
+
+
+def test_openai_compatible_provider_not_configured():
+    provider = OpenAICompatibleProvider()
+    response = provider.generate(ModelRequest(prompt="hi", model="gpt-stub"))
+    assert response.error.code == "not_configured"
+    assert response.content is None
+
+
+def test_openai_compatible_provider_configured_stub():
+    provider = OpenAICompatibleProvider(api_key="test", base_url="http://example.local")
+    response = provider.generate(ModelRequest(prompt="hi", model="gpt-stub"))
+    assert response.error is None
+    assert response.provider == "openai"
+    assert response.content == "openai-compatible stub"
+
+
+def test_anthropic_compatible_provider_not_configured():
+    provider = AnthropicCompatibleProvider()
+    response = provider.generate(ModelRequest(prompt="hi", model="claude-stub"))
+    assert response.error.code == "not_configured"
+
+
+def test_ollama_provider_not_configured():
+    provider = OllamaProvider()
+    response = provider.generate(ModelRequest(prompt="hi", model="llama3"))
+    assert response.error.code == "not_configured"
+
+
+def test_ollama_provider_configured_stub():
+    provider = OllamaProvider(base_url="http://localhost:11434")
+    response = provider.generate(ModelRequest(prompt="hi", model="llama3"))
+    assert response.error is None
+    assert response.content == "ollama stub"
+
+
+def test_model_registry_registration_and_default():
+    registry = ModelRegistry()
+    registry.register(MockModelProvider())
+    registry.register(MockModelProvider(provider_name="second"))
+    assert registry.get("mock") is not None
+    assert registry.get("second") is not None
+    with pytest.raises(ValueError):
+        registry.register(MockModelProvider(provider_name="mock"))
+
+
+def test_model_registry_set_default():
+    registry = ModelRegistry()
+    registry.register(MockModelProvider())
+    registry.register(MockModelProvider(provider_name="fallback"))
+    registry.set_default("fallback")
+    assert registry.default().provider_name == "fallback"
+
+
+def test_model_registry_unknown_provider_returns_none():
+    registry = ModelRegistry()
+    registry.register(MockModelProvider())
+    assert registry.get("missing") is None
+    assert registry.default() is not None
+
+
+def test_model_registry_empty_default_is_none():
+    registry = ModelRegistry()
+    assert registry.default() is None
+
+
+def test_model_provider_secrets_never_logged():
+    provider = OpenAICompatibleProvider(api_key="secret-key", base_url="http://example.local")
+    response = provider.generate(ModelRequest(prompt="hi", model="gpt-stub"))
+    audit_events = [event for event in audit.recent() if event.action == "model.generate"]
+    assert not any("secret-key" in str(event.metadata) for event in audit_events)
+
+
+def test_model_provider_does_not_modify_permissions():
+    pm = PermissionManager()
+    provider = OpenAICompatibleProvider(api_key="test", base_url="http://example.local")
+    try:
+        provider.generate(ModelRequest(prompt="hi", model="gpt-stub"))
+    except Exception:
+        pass
+    assert "gpt-stub" not in pm.granted_permissions
