@@ -41,8 +41,10 @@ _OWNER_DATABASE_URL = os.getenv(
 )
 
 # SSL configuration
-_DB_SSL_MODE = os.getenv("DB_SSL_MODE", "prefer")
-_DB_SSL_ROOT_CERT = os.getenv("DB_SSL_ROOT_CERT", None)
+# Default: verify-full (strongest — encrypts AND verifies server identity)
+# For development with self-signed certs, set DB_SSL_MODE=verify-ca
+_DB_SSL_MODE = os.getenv("DB_SSL_MODE", "verify-full")
+_DB_SSL_ROOT_CERT = os.getenv("DB_SSL_ROOT_CERT", os.path.join(os.path.dirname(__file__), "..", "..", "certs", "ca.crt"))
 _DB_SSL_CLIENT_CERT = os.getenv("DB_SSL_CLIENT_CERT", None)
 _DB_SSL_CLIENT_KEY = os.getenv("DB_SSL_CLIENT_KEY", None)
 
