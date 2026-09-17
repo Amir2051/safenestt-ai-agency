@@ -180,3 +180,31 @@ class AuditEventModel(Base):
         Index("ix_audit_investigation_action", "investigation_id", "action"),
         Index("ix_audit_actor_action", "actor_type", "action"),
     )
+
+
+class APIKeyModel(Base):
+    """PostgreSQL-backed API key storage.
+    
+    Keys are NEVER stored in plaintext — only Argon2id hashes.
+    Each key belongs to exactly one tenant.
+    key_fingerprint is SHA-256 for fast lookup (Argon2 uses random salts).
+    """
+    __tablename__ = "api_keys"
+
+    id = mapped_column(Integer, primary_key=True)
+    key_hash = mapped_column(Text, unique=True, nullable=False, index=True)
+    key_fingerprint = mapped_column(Text, unique=True, nullable=False, index=True)
+    tenant_id = mapped_column(Text, nullable=False, index=True)
+    name = mapped_column(Text, nullable=True)
+    active = mapped_column(Boolean, nullable=False, default=True)
+    revoked = mapped_column(Boolean, nullable=False, default=False)
+    revoked_at = mapped_column(DateTime, nullable=True)
+    expires_at = mapped_column(DateTime, nullable=True)
+    scopes = mapped_column(JSON, nullable=False, default=list)
+    created_at = mapped_column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    last_used_at = mapped_column(DateTime, nullable=True)
+    use_count = mapped_column(Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        Index("ix_api_keys_tenant_active", "tenant_id", "active"),
+    )

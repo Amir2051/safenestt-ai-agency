@@ -1,161 +1,211 @@
-"""API key lifecycle management: hashing, expiry, revocation.
-
-API keys are NEVER stored in plaintext — only salted SHA-256 hashes are kept.
-Each key has an optional expiry and can be revoked at any time.
-"""
+"""PostgreSQL-backed API key storage with Argon2id hashing."""
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import os
 import secrets
-import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, UTC
-from typing import Any
+from typing import Any, Generator
+
+from safenestt.persistence.engine import create_engine, get_engine
+from safenestt.persistence.models import APIKeyModel
 
 logger = logging.getLogger(__name__)
 
+# Fixed pepper - read at module load
+_API_KEY_PEPPER = os.getenv("API_KEY_PEPPER", "safenestt-pepper-change-in-production")
 
-def _hash_key(key: str) -> str:
-    """Hash an API key using SHA-256 with a salt."""
-    salt = os.getenv("API_KEY_SALT", "safenestt-default-salt-change-in-production")
-    return hashlib.sha256(f"{salt}:{key}".encode()).hexdigest()
+# Import argon2 at module level with proper error handling
+try:
+    from argon2 import PasswordHasher
+    from argon2.exceptions import VerifyMismatchError
+    _PH = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=4, hash_len=32, salt_len=16)
+    _ARGON2_AVAILABLE = True
+except ImportError:
+    _ARGON2_AVAILABLE = False
+    _PH = None
 
 
-def generate_api_key(prefix: str = "sn_live_") -> tuple[str, str]:
-    """Generate a new API key. Returns (raw_key, hashed_key).
+def _compute_argon2_hash(key: str) -> str:
+    """Compute Argon2id hash for secure storage."""
+    if _ARGON2_AVAILABLE:
+        return _PH.hash(f"{_API_KEY_PEPPER}:{key}")
+    else:
+        logger.warning("argon2-cffi not installed, using SHA-256 fallback (INSECURE)")
+        salt = os.getenv("API_KEY_SALT", "safenestt-salt")
+        return f"sha256:{hashlib.sha256(f'{salt}:{key}'.encode()).hexdigest()}"
+
+
+def _compute_key_fingerprint(key: str) -> str:
+    """Compute SHA-256 fingerprint for server-side lookup."""
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def _verify_key(key: str, key_hash: str) -> bool:
+    """Verify an API key against a stored hash (constant-time).
     
-    The raw_key is shown ONCE to the user. The hashed_key is stored.
+    Returns True if the key matches, False otherwise.
     """
+    if _ARGON2_AVAILABLE:
+        try:
+            return _PH.verify(key_hash, f"{_API_KEY_PEPPER}:{key}")
+        except VerifyMismatchError:
+            return False
+    else:
+        salt = os.getenv("API_KEY_SALT", "safenestt-salt")
+        expected = f"sha256:{hashlib.sha256(f'{salt}:{key}'.encode()).hexdigest()}"
+        return secrets.compare_digest(expected, key_hash)
+
+
+def generate_api_key(prefix: str = "sn_live_") -> tuple[str, str, str]:
+    """Generate a new API key. Returns (raw_key, key_hash, key_fingerprint)."""
     random_part = secrets.token_urlsafe(32)
     raw_key = f"{prefix}{random_part}"
-    hashed_key = _hash_key(raw_key)
-    return raw_key, hashed_key
+    argon2_hash = _compute_argon2_hash(raw_key)
+    fingerprint = _compute_key_fingerprint(raw_key)
+    return raw_key, argon2_hash, fingerprint
 
 
-def verify_api_key(raw_key: str, hashed_key: str) -> bool:
-    """Verify a raw API key against a stored hash.
-    
-    Uses secrets.compare_digest() for timing-safe comparison.
-    """
-    computed = _hash_key(raw_key)
-    return secrets.compare_digest(computed, hashed_key)
+def verify_api_key(raw_key: str, key_hash: str) -> bool:
+    """Verify a raw API key against a stored Argon2id hash."""
+    return _verify_key(raw_key, key_hash)
 
 
-class RevocationList:
-    """Simple in-memory revocation list. In production, use Redis or DB."""
-    
-    def __init__(self) -> None:
-        self._revoked: set[str] = set()
-        self._load_from_env()
-    
-    def _load_from_env(self) -> None:
-        """Load revoked keys from environment variable (JSON list of HASHES)."""
-        revoked_json = os.getenv("REVOKED_API_KEYS", "[]")
-        try:
-            revoked_list = json.loads(revoked_json)
-            # Store hashes, not raw keys
-            self._revoked = set(revoked_list)
-        except (json.JSONDecodeError, TypeError):
-            self._revoked = set()
-    
-    def revoke(self, raw_key: str) -> None:
-        """Revoke an API key."""
-        hashed = _hash_key(raw_key)
-        self._revoked.add(hashed)
-        logger.info("API key revoked (hash: %s...)", hashed[:12])
-    
-    def is_revoked(self, raw_key: str) -> bool:
-        """Check if an API key is revoked."""
-        return _hash_key(raw_key) in self._revoked
-    
-    def get_revoked_hashes(self) -> set[str]:
-        """Get all revoked key hashes (for inspection)."""
-        return self._revoked.copy()
+@contextmanager
+def _api_key_session() -> Generator:
+    """Session scope for API key operations."""
+    from sqlalchemy.orm import sessionmaker
+    engine = get_engine()
+    if engine is None:
+        engine = create_engine()
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
-class APIKeyRegistry:
-    """Registry of active API keys with tenant mapping and expiry.
+class APIKeyStore:
+    """PostgreSQL-backed API key store with Argon2id hashing."""
     
-    In production, this would be backed by a database. For now, uses
-    environment-based configuration with hashed storage.
-    """
-    
-    def __init__(self) -> None:
-        self._keys: dict[str, dict[str, Any]] = {}  # hashed_key -> {tenant_id, expires_at, scopes}
-        self._revocation_list = RevocationList()
-        self._load_from_env()
-    
-    def _load_from_env(self) -> None:
-        """Load API keys from environment variable (JSON dict).
+    def create_key(
+        self,
+        tenant_id: str,
+        raw_key: str | None = None,
+        name: str | None = None,
+        expires_at: str | None = None,
+        scopes: list[str] | None = None,
+    ) -> tuple[str, str, str]:
+        """Create a new API key. Returns (raw_key, key_hash, key_fingerprint)."""
+        if raw_key is None:
+            raw_key, key_hash, fingerprint = generate_api_key()
+        else:
+            key_hash = _compute_argon2_hash(raw_key)
+            fingerprint = _compute_key_fingerprint(raw_key)
         
-        Format: {"<hashed_key>": {"tenant_id": "...", "expires_at": "...", "scopes": [...]}}
-        """
-        keys_json = os.getenv("API_KEYS", "{}")
-        try:
-            keys_data = json.loads(keys_json)
-            for hashed_key, metadata in keys_data.items():
-                self._keys[hashed_key] = {
-                    "tenant_id": metadata.get("tenant_id", "unknown"),
-                    "expires_at": metadata.get("expires_at"),  # ISO format or None
-                    "scopes": metadata.get("scopes", ["read", "write"]),
-                }
-        except (json.JSONDecodeError, TypeError):
-            self._keys = {}
+        with _api_key_session() as session:
+            parsed_expires = None
+            if expires_at:
+                try:
+                    parsed_expires = datetime.fromisoformat(expires_at)
+                except (ValueError, TypeError):
+                    raise ValueError(f"Invalid expiry format: {expires_at}")
+            
+            model = APIKeyModel(
+                key_hash=key_hash,
+                key_fingerprint=fingerprint,
+                tenant_id=tenant_id,
+                name=name,
+                active=True,
+                revoked=False,
+                expires_at=parsed_expires,
+                scopes=scopes or ["read", "write"],
+            )
+            session.add(model)
+            session.flush()
+        
+        return raw_key, key_hash, fingerprint
     
-    def register_key(self, tenant_id: str, raw_key: str, 
-                     expires_at: str | None = None, 
-                     scopes: list[str] | None = None) -> str:
-        """Register a new API key for a tenant. Returns the hashed key."""
-        hashed = _hash_key(raw_key)
-        self._keys[hashed] = {
-            "tenant_id": tenant_id,
-            "expires_at": expires_at,
-            "scopes": scopes or ["read", "write"],
-        }
-        return hashed
+    def revoke_key(self, raw_key: str) -> bool:
+        """Revoke an API key by its raw value."""
+        with _api_key_session() as session:
+            candidates = session.query(APIKeyModel).filter(
+                APIKeyModel.active == True,
+            ).all()
+            
+            for key_record in candidates:
+                if _verify_key(raw_key, key_record.key_hash):
+                    key_record.revoked = True
+                    key_record.revoked_at = datetime.now(UTC)
+                    key_record.active = False
+                    session.flush()
+                    return True
+            
+            return False
     
-    def validate_key(self, raw_key: str) -> tuple[bool, str, dict[str, Any]]:
-        """Validate an API key.
-        
-        Returns: (is_valid, tenant_id, metadata)
-        is_revoked checks the revocation list.
-        """
-        hashed = _hash_key(raw_key)
-        
-        # Check revocation first
-        if self._revocation_list.is_revoked(raw_key):
-            return False, "", {"error": "key_revoked"}
-        
-        # Check if key exists
-        if hashed not in self._keys:
-            return False, "", {"error": "key_not_found"}
-        
-        metadata = self._keys[hashed]
-        
-        # Check expiry
-        expires_at = metadata.get("expires_at")
-        if expires_at:
-            try:
-                expiry = datetime.fromisoformat(expires_at)
-                if datetime.now(UTC) > expiry:
-                    return False, "", {"error": "key_expired"}
-            except (ValueError, TypeError):
-                # Invalid expiry format — treat as expired (fail closed)
-                return False, "", {"error": "key_expired"}
-        
-        return True, metadata["tenant_id"], metadata
+    def validate_key(self, raw_key: str) -> tuple[bool, str, str, dict[str, Any]]:
+        """Validate an API key. Returns (is_valid, tenant_id, key_fingerprint, metadata)."""
+        with _api_key_session() as session:
+            now = datetime.now(UTC)
+            all_keys = session.query(APIKeyModel).all()
+            
+            for key_record in all_keys:
+                if _verify_key(raw_key, key_record.key_hash):
+                    if key_record.revoked:
+                        return False, "", "", {"error": "key_revoked"}
+                    
+                    # Check expiry - handle both aware and naive datetimes
+                    if key_record.expires_at:
+                        try:
+                            expires_at = key_record.expires_at
+                            # If offset-naive, assume UTC
+                            if expires_at.tzinfo is None:
+                                from datetime import timezone
+                                expires_at = expires_at.replace(tzinfo=timezone.utc)
+                            if datetime.now(UTC) > expires_at:
+                                return False, "", "", {"error": "key_expired"}
+                        except (ValueError, TypeError):
+                            # Invalid expiry format — fail closed
+                            return False, "", "", {"error": "key_expired"}
+                    
+                    if not key_record.active:
+                        return False, "", "", {"error": "key_inactive"}
+                    
+                    fingerprint = _compute_key_fingerprint(raw_key)
+                    
+                    key_record.last_used_at = now
+                    key_record.use_count = (key_record.use_count or 0) + 1
+                    session.flush()
+                    
+                    return True, key_record.tenant_id, fingerprint, {
+                        "name": key_record.name,
+                        "scopes": key_record.scopes or [],
+                        "created_at": key_record.created_at,
+                        "expires_at": key_record.expires_at,
+                    }
+            
+            return False, "", "", {"error": "key_not_found"}
     
-    def revoke_key(self, raw_key: str) -> None:
-        """Revoke an API key."""
-        self._revocation_list.revoke(raw_key)
+    def rotate_key(self, old_raw_key: str, tenant_id: str) -> tuple[str, str, str]:
+        """Rotate an API key: create new, revoke old."""
+        is_valid, _, _, _ = self.validate_key(old_raw_key)
+        if not is_valid:
+            raise ValueError("Invalid or expired key")
+        
+        self.revoke_key(old_raw_key)
+        return self.create_key(tenant_id=tenant_id)
 
 
-# Global singleton
-_key_registry = APIKeyRegistry()
+_key_store = APIKeyStore()
 
 
-def get_key_registry() -> APIKeyRegistry:
-    """Get the global API key registry."""
-    return _key_registry
+def get_key_store() -> APIKeyStore:
+    """Get the global API key store."""
+    return _key_store

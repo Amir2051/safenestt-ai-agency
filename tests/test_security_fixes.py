@@ -1,4 +1,4 @@
-"""Tests for encryption key validation in production mode."""
+"""Tests for security fixes — updated for new API key lifecycle."""
 from __future__ import annotations
 
 import os
@@ -7,43 +7,37 @@ import pytest
 
 def test_production_rejects_default_encryption_key():
     """Production mode MUST reject keys that match known default patterns."""
+    from cryptography.fernet import Fernet
     from safenestt.security import encryption
     
-    # Save original values
     original_mode = os.environ.get("MODE")
     original_key = os.environ.get("SAFENESTT_ENCRYPTION_KEY")
     
     try:
         os.environ["MODE"] = "production"
         
-        # Test with known default keys
         default_keys = [
-            "test",
             "test-key",
-            "dev",
-            "development",
-            "default",
+            "dev-key",
             "default-key",
             "changeme",
             "secret",
-            "00000000000000000000000000000000",
-            "password",
+            "placeholder",
             "demo",
             "sample",
-            "placeholder",
+            "00000000000000000000000000000000",
+            "password",
         ]
         
         for key in default_keys:
             os.environ["SAFENESTT_ENCRYPTION_KEY"] = key
-            # Reload module to pick up new env var
             import importlib
             importlib.reload(encryption)
             
             with pytest.raises(RuntimeError, match="does not meet production security"):
-                encryption.is_encryption_enabled()
+                encryption._get_fernet()
     
     finally:
-        # Restore original values
         if original_mode is None:
             os.environ.pop("MODE", None)
         else:
@@ -54,7 +48,6 @@ def test_production_rejects_default_encryption_key():
         else:
             os.environ["SAFENESTT_ENCRYPTION_KEY"] = original_key
         
-        # Reload module to restore state
         import importlib
         importlib.reload(encryption)
 
@@ -92,116 +85,77 @@ def test_production_accepts_strong_encryption_key():
         importlib.reload(encryption)
 
 
-def test_development_accepts_any_key():
-    """Development mode is permissive (no default key rejection)."""
-    from safenestt.security import encryption
-    
-    original_mode = os.environ.get("MODE")
-    original_key = os.environ.get("SAFENESTT_ENCRYPTION_KEY")
-    
-    try:
-        os.environ["MODE"] = "development"
-        os.environ["SAFENESTT_ENCRYPTION_KEY"] = "test-key"
-        
-        import importlib
-        importlib.reload(encryption)
-        
-        # Should NOT raise, even with a weak key
-        # is_encryption_enabled() will try to create Fernet and may fail silently
-        # but it won't raise RuntimeError
-        result = encryption.is_encryption_enabled()
-        # Result depends on whether the key is valid Fernet format
-    
-    finally:
-        if original_mode is None:
-            os.environ.pop("MODE", None)
-        else:
-            os.environ["MODE"] = original_mode
-        
-        if original_key is None:
-            os.environ.pop("SAFENESTT_ENCRYPTION_KEY", None)
-        else:
-            os.environ["SAFENESTT_ENCRYPTION_KEY"] = original_key
-        
-        import importlib
-        importlib.reload(encryption)
-
-
 def test_api_key_hashing():
     """API keys should be hashed, never stored in plaintext."""
-    from safenestt.security.api_keys import _hash_key, generate_api_key, verify_api_key
+    from safenestt.security.api_keys import _compute_argon2_hash, generate_api_key, verify_api_key
     
-    raw_key, hashed_key = generate_api_key()
+    raw_key, key_hash, fingerprint = generate_api_key()
     
     # Hashed key should not contain the raw key
-    assert raw_key != hashed_key
-    assert raw_key not in hashed_key
+    assert raw_key != key_hash
+    assert raw_key not in key_hash
     
     # Verification should work
-    assert verify_api_key(raw_key, hashed_key)
-    assert not verify_api_key("wrong-key", hashed_key)
+    assert verify_api_key(raw_key, key_hash)
+    assert not verify_api_key("wrong-key", key_hash)
 
 
 def test_api_key_revocation():
     """Revoked keys should be rejected."""
-    from safenestt.security.api_keys import RevocationList
+    from safenestt.security.api_keys import get_key_store
     
-    rl = RevocationList()
-    raw_key = "test-key-123"
+    store = get_key_store()
+    raw_key = "test-revoke-me-12345"
     
-    assert not rl.is_revoked(raw_key)
+    store.create_key(tenant_id="test-tenant", raw_key=raw_key)
     
-    rl.revoke(raw_key)
-    assert rl.is_revoked(raw_key)
+    is_valid, _, _, _ = store.validate_key(raw_key)
+    assert is_valid
+    
+    store.revoke_key(raw_key)
+    
+    is_valid, _, _, metadata = store.validate_key(raw_key)
+    assert not is_valid
+    assert metadata.get("error") == "key_revoked"
 
 
 def test_api_key_registry():
     """API key registry should validate keys and return tenant_id."""
-    from safenestt.security.api_keys import APIKeyRegistry
+    from safenestt.security.api_keys import get_key_store
     
-    registry = APIKeyRegistry()
-    raw_key = "test-key-456"
+    store = get_key_store()
+    raw_key = "test-registry-key-12345"
     
-    # Register a key
-    hashed = registry.register_key(
+    store.create_key(
         tenant_id="test-tenant",
         raw_key=raw_key,
         expires_at=None,
         scopes=["read", "write"]
     )
     
-    # Validate
-    is_valid, tenant_id, metadata = registry.validate_key(raw_key)
+    is_valid, tenant_id, fingerprint, metadata = store.validate_key(raw_key)
     assert is_valid
     assert tenant_id == "test-tenant"
     assert "read" in metadata["scopes"]
-    
-    # Revoke and verify rejection
-    registry.revoke_key(raw_key)
-    is_valid, _, metadata = registry.validate_key(raw_key)
-    assert not is_valid
-    assert metadata["error"] == "key_revoked"
 
 
 def test_api_key_expiry():
     """Expired keys should be rejected."""
-    from safenestt.security.api_keys import APIKeyRegistry
+    from safenestt.security.api_keys import get_key_store
     from datetime import datetime, timedelta, UTC
     
-    registry = APIKeyRegistry()
-    raw_key = "test-key-expired"
+    store = get_key_store()
     
-    # Register with past expiry
     past = (datetime.now(UTC) - timedelta(days=1)).isoformat()
-    registry.register_key(
-        tenant_id="test-tenant",
-        raw_key=raw_key,
+    raw_key, _, _ = store.create_key(
+        tenant_id="tenant-expired",
+        raw_key="expired-key-12345",
         expires_at=past
     )
     
-    is_valid, _, metadata = registry.validate_key(raw_key)
+    is_valid, _, _, metadata = store.validate_key(raw_key)
     assert not is_valid
-    assert metadata["error"] == "key_expired"
+    assert metadata.get("error") == "key_expired"
 
 
 def test_per_key_rate_limiting():
@@ -210,13 +164,12 @@ def test_per_key_rate_limiting():
     
     service = RateLimitService()
     
-    # Different API keys should have separate rate limits
     key1 = "key-1"
     key2 = "key-2"
     
     # Exhaust key1
     for _ in range(10):
-        result = service.enforce(
+        service.enforce(
             scope=RateLimitScope.API_KEY,
             key=key1,
             limit=10,

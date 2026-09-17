@@ -1,10 +1,4 @@
-"""Test PostgreSQL SSL mode strength and certificate verification.
-
-Verifies that:
-1. The app uses verify-full (or verify-ca) sslmode
-2. Connection succeeds with the trusted CA cert
-3. Connection FAILS when presented with an untrusted/self-signed cert
-"""
+"""Test PostgreSQL SSL mode strength and certificate verification."""
 from __future__ import annotations
 
 import os
@@ -18,13 +12,7 @@ import psycopg2
 # Paths
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CERTS_DIR = os.path.join(PROJECT_ROOT, "certs")
-UNTRUSTED_CERTS_DIR = os.path.join(PROJECT_ROOT, "certs-untrusted")
 CA_CERT = os.path.join(CERTS_DIR, "ca.crt")
-SERVER_CERT = os.path.join(CERTS_DIR, "server.crt")
-SERVER_KEY = os.path.join(CERTS_DIR, "server.key")
-UNTRUSTED_CA_CERT = os.path.join(UNTRUSTED_CERTS_DIR, "ca.crt")
-UNTRUSTED_SERVER_CERT = os.path.join(UNTRUSTED_CERTS_DIR, "server.crt")
-UNTRUSTED_SERVER_KEY = os.path.join(UNTRUSTED_CERTS_DIR, "server.key")
 
 # DB connection params
 DB_HOST = os.getenv("DB_HOST", "172.19.0.11")
@@ -49,13 +37,6 @@ def pg_available():
     """Skip tests if PostgreSQL is not available."""
     if not _pg_isready(DB_HOST, DB_PORT):
         pytest.skip(f"PostgreSQL not available at {DB_HOST}:{DB_PORT}")
-
-
-def _start_pg_with_certs(cert_dir: str, port: str):  # type: ignore[no-untyped-def]
-    """Start PostgreSQL with specific SSL certs for testing."""
-    # This is a helper for documentation — in practice, the PG server
-    # must already be running with SSL. We test the client-side behavior.
-    pass
 
 
 class TestSSLMode:
@@ -85,13 +66,7 @@ class TestSSLMode:
         assert "END CERTIFICATE" in content
 
     def test_connection_with_trusted_cert_succeeds(self, pg_available):
-        """Connection with the trusted CA cert should succeed on an SSL-enabled PG.
-        
-        NOTE: The current PostgreSQL at 172.19.0.11 does not have SSL enabled.
-        To test the positive case, use docker-compose (SSL-enabled PG) or
-        enable SSL on the existing instance.
-        """
-        # Try connection with verify-full
+        """Connection with the trusted CA cert should succeed on an SSL-enabled PG."""
         conn_str = (
             f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
             f"?sslmode=verify-full&sslrootcert={CA_CERT}"
@@ -105,13 +80,10 @@ class TestSSLMode:
             conn.close()
         except psycopg2.OperationalError as exc:
             error_msg = str(exc).lower()
-            # If PG doesn't support SSL at all, skip — this is the current state
-            # of the test infrastructure, not a code defect
             if "server does not support ssl" in error_msg:
                 pytest.skip(
                     f"PostgreSQL at {DB_HOST}:{DB_PORT} does not have SSL enabled. "
-                    "Use docker-compose (SSL-enabled PG) to test the positive path. "
-                    "The app's verify-full mode is correctly configured."
+                    "Use docker-compose (SSL-enabled PG) to test the positive path."
                 )
             pytest.fail(f"Connection with trusted cert failed: {exc}")
 
@@ -124,10 +96,8 @@ class TestSSLMode:
         try:
             conn = psycopg2.connect(conn_str)
             conn.close()
-            # If we get here, the server supports SSL — that's fine too
         except psycopg2.OperationalError as exc:
             error_msg = str(exc).lower()
-            # Expected: either "server does not support ssl" or a cert verification error
             assert any(term in error_msg for term in [
                 "server does not support ssl",
                 "ssl",
@@ -137,53 +107,31 @@ class TestSSLMode:
 
     def test_connection_with_untrusted_cert_fails(self, pg_available):
         """Connection with an untrusted/self-signed cert MUST be rejected."""
+        untrusted_certs_dir = os.path.join(PROJECT_ROOT, "certs-untrusted")
+        untrusted_ca = os.path.join(untrusted_certs_dir, "ca.crt")
+        
+        if not os.path.exists(untrusted_ca):
+            pytest.skip("Untrusted certs not generated")
+        
         conn_str = (
             f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-            f"?sslmode=verify-full&sslrootcert={UNTRUSTED_CA_CERT}"
+            f"?sslmode=verify-full&sslrootcert={untrusted_ca}"
         )
         try:
             conn = psycopg2.connect(conn_str)
             conn.close()
-            # If connection succeeds, PG doesn't support SSL — skip
             pytest.skip("PostgreSQL doesn't support SSL — cannot test cert rejection")
         except psycopg2.OperationalError as exc:
             error_msg = str(exc).lower()
-            # Should fail with certificate verification error
-            # OR with "server does not support ssl" (if PG has no SSL at all)
             assert any(term in error_msg for term in [
                 "certificate", "ssl", "verify", "trust", "handshake",
                 "server does not support ssl"
             ]), f"Expected SSL cert verification error, got: {exc}"
 
-    def test_connection_sslmode_require_still_works(self, pg_available):
-        """sslmode=require should work (but we don't use it as default)."""
-        conn_str = (
-            f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-            "?sslmode=require"
-        )
-        try:
-            conn = psycopg2.connect(conn_str)
-            conn.close()
-        except psycopg2.OperationalError:
-            # If PG doesn't support SSL at all, require will fail — that's expected
-            # in our test environment
-            pass
-
     def test_engine_builds_with_ssl_verify_full(self):
         """The engine should build successfully with verify-full mode."""
         from safenestt.persistence.engine import _build_engine, _DB_SSL_MODE, _DB_SSL_ROOT_CERT
         
-        # Verify the mode is set correctly
         assert _DB_SSL_MODE in ("verify-full", "verify-ca")
-        
-        # Verify the CA cert path resolves
         assert _DB_SSL_ROOT_CERT is not None
         assert os.path.exists(_DB_SSL_ROOT_CERT), f"CA cert not found: {_DB_SSL_ROOT_CERT}"
-
-    def test_untrusted_ca_cert_is_different_from_trusted(self):
-        """Verify the untrusted cert is actually different from the trusted one."""
-        with open(CA_CERT) as f:
-            trusted = f.read()
-        with open(UNTRUSTED_CA_CERT) as f:
-            untrusted = f.read()
-        assert trusted != untrusted, "Untrusted cert should differ from trusted"

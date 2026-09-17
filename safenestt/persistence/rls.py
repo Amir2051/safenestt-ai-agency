@@ -1,16 +1,23 @@
-"""Row Level Security (RLS) for PostgreSQL tenant isolation.
+"""Row Level Security (RLS) with session-bound tenant context.
 
-RLS policies are enforced at the database level. They apply to all
-non-owner roles. The table owner (typically `postgres`) bypasses RLS
-by default in PostgreSQL. For production defense-in-depth, the
-application connects as a dedicated non-owner role (`safenestt_app`).
+DESIGN:
+-------
+1. Application layer (Python) validates the API key against stored Argon2id hashes
+2. On successful validation, app calls establish_tenant_context(tenant_id, key_fingerprint)
+3. SECURITY DEFINER function verifies the fingerprint matches an active key
+4. On match, records (pg_backend_pid(), tenant_id) in _tenant_context
+5. RLS policies use get_current_tenant() which reads from _tenant_context
 
-The `apply_rls_policies()` function enables RLS and creates policies
-on all tables. The `set_tenant_context()` helper sets the `app.current_tenant_id`
-GUC that the policies read from.
+The key_fingerprint is SHA-256 of the raw key — deterministic, so the SQL function
+can look it up in api_keys without needing Argon2 (which isn't available in SQL).
 
-CRITICAL: RLS policies use SECURITY DEFINER functions to prevent
-the app role from spoofing the tenant context.
+ATTACK ANALYSIS:
+- SET app.current_tenant_id → ineffective (policies don't read GUC)
+- establish_tenant_context(tenant_id='other', key_fingerprint='guess') → fails because
+  fingerprint won't match any active key in the database
+- establish_tenant_context with own fingerprint → only binds own tenant_id
+- Direct INSERT on _tenant_context → REVOKE ALL from app role
+- Fake pg_backend_pid() → impossible (kernel-assigned)
 """
 from __future__ import annotations
 
@@ -18,44 +25,39 @@ from typing import Any
 
 from sqlalchemy import text
 
-# Fixed search_path for SECURITY DEFINER functions
-_SEARCH_PATH = "SET search_path = public"
 
-
-def set_tenant_context(connection: Any, tenant_id: str | None) -> None:
-    """Set the PostgreSQL GUC for RLS tenant filtering.
+def set_tenant_context(connection: Any, tenant_id: str, key_fingerprint: str) -> str:
+    """Establish tenant context after application-layer key validation.
     
-    Uses a SECURITY DEFINER function to validate and set tenant context.
-    The app role cannot bypass this validation.
+    Args:
+        connection: Database connection
+        tenant_id: The tenant_id from validated key
+        key_fingerprint: SHA-256 of the raw API key (for server-side verification)
+    
+    Returns: The established tenant_id
+    
+    Raises: Exception if key_fingerprint doesn't match an active key
     """
-    connection.execute(text(_SEARCH_PATH))
-    if tenant_id:
-        connection.execute(
-            text("SELECT set_app_tenant_context(:tid)"),
-            {"tid": tenant_id}
-        )
-    else:
-        connection.execute(text("SELECT clear_app_tenant_context()"))
+    result = connection.execute(
+        text("SELECT establish_tenant_context(:tid, :fp)"),
+        {"tid": tenant_id, "fp": key_fingerprint}
+    ).scalar()
+    return result
 
 
 def clear_tenant_context(connection: Any) -> None:
-    """Clear the RLS tenant context."""
-    connection.execute(text(_SEARCH_PATH))
-    connection.execute(text("SELECT clear_app_tenant_context()"))
+    """Clear tenant context for the current session."""
+    connection.execute(text("SELECT clear_tenant_context()"))
 
 
 def get_current_tenant_id(connection: Any) -> str | None:
-    """Get the current tenant context from the database."""
-    connection.execute(text(_SEARCH_PATH))
+    """Get the current tenant context."""
     result = connection.execute(
-        text("SELECT get_app_tenant_context()")
+        text("SELECT get_current_tenant()")
     ).scalar()
     return result if result != "" else None
 
 
-# SQL to create RLS policies on all tenant-scoped tables
-# Policies use get_app_tenant_context() SECURITY DEFINER function
-# to prevent the app role from spoofing the tenant context
 RLS_POLICY_SQL = """
 -- Enable RLS on all tables
 ALTER TABLE investigations ENABLE ROW LEVEL SECURITY;
@@ -65,7 +67,7 @@ ALTER TABLE evidence ENABLE ROW LEVEL SECURITY;
 ALTER TABLE reports ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_events ENABLE ROW LEVEL SECURITY;
 
--- Force RLS for table owners too (defense in depth)
+-- Force RLS for table owners
 ALTER TABLE investigations FORCE ROW LEVEL SECURITY;
 ALTER TABLE agent_runs FORCE ROW LEVEL SECURITY;
 ALTER TABLE findings FORCE ROW LEVEL SECURITY;
@@ -73,7 +75,7 @@ ALTER TABLE evidence FORCE ROW LEVEL SECURITY;
 ALTER TABLE reports FORCE ROW LEVEL SECURITY;
 ALTER TABLE audit_events FORCE ROW LEVEL SECURITY;
 
--- Drop existing policies if any (idempotent)
+-- Drop existing policies
 DROP POLICY IF EXISTS investigations_tenant_isolation ON investigations;
 DROP POLICY IF EXISTS agent_runs_tenant_isolation ON agent_runs;
 DROP POLICY IF EXISTS findings_tenant_isolation ON findings;
@@ -81,50 +83,44 @@ DROP POLICY IF EXISTS evidence_tenant_isolation ON evidence;
 DROP POLICY IF EXISTS reports_tenant_isolation ON reports;
 DROP POLICY IF EXISTS audit_events_tenant_isolation ON audit_events;
 
--- Investigations: direct tenant_id match using SECURITY DEFINER function
+-- Policies use get_current_tenant()
 CREATE POLICY investigations_tenant_isolation ON investigations
-    USING (tenant_id = get_app_tenant_context());
+    USING (tenant_id = get_current_tenant());
 
--- Child tables: join to investigations for tenant check
 CREATE POLICY agent_runs_tenant_isolation ON agent_runs
     USING (investigation_id IN (
         SELECT investigation_id FROM investigations
-        WHERE tenant_id = get_app_tenant_context()
+        WHERE tenant_id = get_current_tenant()
     ));
 
 CREATE POLICY findings_tenant_isolation ON findings
     USING (investigation_id IN (
         SELECT investigation_id FROM investigations
-        WHERE tenant_id = get_app_tenant_context()
+        WHERE tenant_id = get_current_tenant()
     ));
 
 CREATE POLICY evidence_tenant_isolation ON evidence
     USING (investigation_id IN (
         SELECT investigation_id FROM investigations
-        WHERE tenant_id = get_app_tenant_context()
+        WHERE tenant_id = get_current_tenant()
     ));
 
 CREATE POLICY reports_tenant_isolation ON reports
     USING (investigation_id IN (
         SELECT investigation_id FROM investigations
-        WHERE tenant_id = get_app_tenant_context()
+        WHERE tenant_id = get_current_tenant()
     ));
 
--- Audit events: investigation_id IS NULL for system-level events
 CREATE POLICY audit_events_tenant_isolation ON audit_events
     USING (investigation_id IS NULL OR investigation_id IN (
         SELECT investigation_id FROM investigations
-        WHERE tenant_id = get_app_tenant_context()
+        WHERE tenant_id = get_current_tenant()
     ));
 """
 
 
 def apply_rls_policies(engine: Any) -> None:
-    """Apply RLS policies to all tenant-scoped tables.
-    
-    Safe to call multiple times — drops and recreates policies.
-    Must be called AFTER tables exist AND SECURITY DEFINER functions exist.
-    """
+    """Apply RLS policies."""
     with engine.connect() as conn:
         conn.execute(text(RLS_POLICY_SQL))
         conn.commit()

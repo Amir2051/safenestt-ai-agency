@@ -10,7 +10,7 @@ if repo_root not in sys.path:
 import safenestt  # noqa: E402
 import safenestt.security.permissions as _permissions_mod  # noqa: E402
 
-# Initialize DB engine for tests that use PersistentInvestigationService
+# Initialize DB engine for tests that use PersistentInvestigationStore
 import pytest
 from safenestt.persistence.engine import create_engine, get_owner_engine
 from safenestt.security.secrets import clear_cache
@@ -33,22 +33,29 @@ print("[conftest] permissions:", _permissions_mod.__file__, file=sys.stderr)
 
 @pytest.fixture(autouse=True)
 def _clean_test_db():
-    """Clean test data before each test to avoid unique constraint violations."""
+    """Clean test data before each test.
+    
+    Order:
+    1. Create schema (owner engine)
+    2. Apply RLS policies
+    3. Truncate ALL tables (app engine) — including api_keys
+    4. Reset API key store singleton
+    """
     from safenestt.persistence.models import Base
     from sqlalchemy import text, inspect as sa_inspect
     
-    # Use owner engine for schema setup (owner privileges needed for RLS)
+    # Use owner engine for schema setup
     owner_engine = get_owner_engine()
     Base.metadata.create_all(owner_engine)
     
-    # Apply RLS policies (ignore errors if already applied)
+    # Apply RLS policies
     try:
         from safenestt.persistence.rls import apply_rls_policies
         apply_rls_policies(owner_engine)
     except Exception:
         pass
     
-    # Use app engine for test data operations
+    # Truncate ALL tables
     from safenestt.persistence.engine import get_engine
     engine = get_engine()
     if engine:
@@ -59,6 +66,7 @@ def _clean_test_db():
                 if table.name in existing_tables:
                     conn.execute(text(f"TRUNCATE TABLE {table.name} CASCADE"))
             conn.commit()
+    
     yield
 
 

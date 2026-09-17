@@ -1,4 +1,10 @@
-"""Production API store backed by PostgreSQL with RLS, encryption, and audit."""
+"""Production API store backed by PostgreSQL with RLS, encryption, and audit.
+
+CRITICAL: This store uses session-bound tenant context for RLS.
+Instead of passing tenant_id directly to session_scope (which could be spoofed),
+we pass the API key hash. The SECURITY DEFINER function establish_tenant_context()
+validates the key hash and records (pg_backend_pid(), tenant_id) server-side.
+"""
 from __future__ import annotations
 
 import uuid
@@ -26,23 +32,29 @@ class TenantIsolationError(PermissionError):
 
 
 class PersistentInvestigationStore:
-    """PostgreSQL-backed store with RLS, encryption, and audit logging."""
+    """PostgreSQL-backed store with RLS, encryption, and audit logging.
     
-    def __init__(self, tenant_id: str | None = None):
-        self._tenant_id = tenant_id
+    Uses session-bound tenant context: the API key hash is passed to
+    session_scope(), which calls establish_tenant_context() to validate
+    and record the tenant context server-side.
+    """
     
-    def _require_tenant(self) -> str:
-        if not self._tenant_id:
-            raise TenantIsolationError("Tenant context required for database access")
-        return self._tenant_id
+    def __init__(self, api_key_hash: str | None = None, tenant_id: str | None = None):
+        self._api_key_hash = api_key_hash
+        self._tenant_id = tenant_id  # Only used for bypass operations
+    
+    def _session(self):
+        """Get a session scope with tenant context established."""
+        return session_scope(self._api_key_hash)
     
     def create_investigation(self, record: InvestigationRecord) -> InvestigationRecord:
-        tenant_id = self._require_tenant()
+        if not self._api_key_hash:
+            raise TenantIsolationError("API key required for database access")
         
-        with session_scope(tenant_id) as session:
+        with self._session() as session:
             model = InvestigationModel(
                 investigation_id=record.investigation_id,
-                tenant_id=tenant_id,
+                tenant_id=record.tenant_id,
                 created_by=record.created_by,
                 target=encrypt_value(record.target),
                 type=record.type,
@@ -66,13 +78,10 @@ class PersistentInvestigationStore:
             return record
     
     def get_investigation(self, investigation_id: str) -> InvestigationRecord | None:
-        """Get investigation by ID. Raises TenantIsolationError if record exists but belongs to another tenant.
+        if not self._api_key_hash:
+            raise TenantIsolationError("API key required for database access")
         
-        Uses a SECURITY DEFINER function to detect cross-tenant access without needing owner credentials.
-        """
-        tenant_id = self._require_tenant()
-        
-        with session_scope(tenant_id) as session:
+        with self._session() as session:
             from sqlalchemy import select
             result = session.execute(
                 select(InvestigationModel).where(
@@ -81,18 +90,6 @@ class PersistentInvestigationStore:
             ).scalar_one_or_none()
             
             if result is None:
-                # Use SECURITY DEFINER function to check cross-tenant access
-                # This runs with elevated privileges but only returns a boolean
-                from sqlalchemy import text
-                is_cross_tenant = session.execute(
-                    text("SELECT check_cross_tenant_access(:id, :tid)"),
-                    {"id": investigation_id, "tid": tenant_id}
-                ).scalar()
-                
-                if is_cross_tenant:
-                    raise TenantIsolationError(
-                        f"investigation {investigation_id} not accessible for tenant {tenant_id}"
-                    )
                 return None
             
             return InvestigationRecord(
@@ -107,9 +104,10 @@ class PersistentInvestigationStore:
             )
     
     def update_investigation(self, record: InvestigationRecord) -> InvestigationRecord:
-        tenant_id = self._require_tenant()
+        if not self._api_key_hash:
+            raise TenantIsolationError("API key required for database access")
         
-        with session_scope(tenant_id) as session:
+        with self._session() as session:
             from sqlalchemy import select
             result = session.execute(
                 select(InvestigationModel).where(
@@ -119,7 +117,7 @@ class PersistentInvestigationStore:
             
             if result is None:
                 raise TenantIsolationError(
-                    f"investigation {record.investigation_id} not found for tenant {tenant_id}"
+                    f"investigation {record.investigation_id} not found or access denied"
                 )
             
             result.status = record.status
@@ -131,9 +129,10 @@ class PersistentInvestigationStore:
             return record
     
     def add_evidence(self, evidence: EvidenceRecord) -> EvidenceRecord:
-        tenant_id = self._require_tenant()
+        if not self._api_key_hash:
+            raise TenantIsolationError("API key required for database access")
         
-        with session_scope(tenant_id) as session:
+        with self._session() as session:
             model = EvidenceModel(
                 evidence_id=evidence.evidence_id,
                 investigation_id=evidence.investigation_id,
@@ -151,15 +150,10 @@ class PersistentInvestigationStore:
             return evidence
     
     def list_evidence(self, investigation_id: str) -> list[EvidenceRecord]:
-        """List evidence for an investigation. Raises TenantIsolationError if investigation belongs to another tenant."""
-        tenant_id = self._require_tenant()
+        if not self._api_key_hash:
+            raise TenantIsolationError("API key required for database access")
         
-        # First verify the investigation belongs to this tenant
-        inv = self.get_investigation(investigation_id)
-        if inv is None:
-            return []
-        
-        with session_scope(tenant_id) as session:
+        with self._session() as session:
             from sqlalchemy import select
             results = session.execute(
                 select(EvidenceModel).where(
@@ -183,9 +177,10 @@ class PersistentInvestigationStore:
             ]
     
     def add_finding(self, finding: FindingRecord) -> FindingRecord:
-        tenant_id = self._require_tenant()
+        if not self._api_key_hash:
+            raise TenantIsolationError("API key required for database access")
         
-        with session_scope(tenant_id) as session:
+        with self._session() as session:
             model = FindingModel(
                 finding_id=finding.finding_id,
                 investigation_id=finding.investigation_id,
@@ -201,14 +196,10 @@ class PersistentInvestigationStore:
             return finding
     
     def list_findings(self, investigation_id: str) -> list[FindingRecord]:
-        tenant_id = self._require_tenant()
+        if not self._api_key_hash:
+            raise TenantIsolationError("API key required for database access")
         
-        # First verify the investigation belongs to this tenant
-        inv = self.get_investigation(investigation_id)
-        if inv is None:
-            return []
-        
-        with session_scope(tenant_id) as session:
+        with self._session() as session:
             from sqlalchemy import select
             results = session.execute(
                 select(FindingModel).where(
@@ -230,9 +221,10 @@ class PersistentInvestigationStore:
             ]
     
     def list_investigations(self) -> list[InvestigationRecord]:
-        tenant_id = self._require_tenant()
+        if not self._api_key_hash:
+            raise TenantIsolationError("API key required for database access")
         
-        with session_scope(tenant_id) as session:
+        with self._session() as session:
             from sqlalchemy import select
             results = session.execute(
                 select(InvestigationModel)
