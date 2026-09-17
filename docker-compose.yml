@@ -30,6 +30,7 @@ services:
       retries: 5
 
   # Migration job: runs once, then exits. Holds owner credentials ONLY here.
+  # This is a one-shot container, not part of the always-running API stack.
   migrate:
     build: .
     command: python -m safenestt.persistence.migrate
@@ -37,7 +38,7 @@ services:
       DB_HOST: postgres
       DB_PORT: 5432
       DB_NAME: safenestt_ai
-      SAFENESTT_DB_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      SAFENESTT_OWNER_DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/safenestt_ai
       DB_SSL_MODE: verify-full
       DB_SSL_ROOT_CERT: /app/certs/ca.crt
     volumes:
@@ -47,8 +48,16 @@ services:
         condition: service_healthy
     restart: "no"
 
+  # Entrypoint script: waits for migrate to complete before starting API
   api:
     build: .
+    command: >
+      sh -c "
+        echo 'Waiting for migration to complete...' &&
+        ! dockerize -wait tcp://postgres:5432 -timeout 60s 2>/dev/null &&
+        python -m safenestt.persistence.wait_for_migrate &&
+        uvicorn safenestt.api:app --host 0.0.0.0 --port 8000
+      "
     environment:
       MODE: ${MODE:-development}
       HOST: 0.0.0.0
@@ -58,11 +67,11 @@ services:
       DB_PORT: 5432
       DB_NAME: safenestt_ai
       SAFENESTT_DB_PASSWORD: ${DB_PASSWORD:-safenestt_app_pass}
-      # NO SAFENESTT_OWNER_PASSWORD — API runs as least-privilege role only
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       SAFENESTT_ENCRYPTION_KEY: ${SAFENESTT_ENCRYPTION_KEY:-}
       DB_SSL_MODE: verify-full
       DB_SSL_ROOT_CERT: /app/certs/ca.crt
+      # NO SAFENESTT_OWNER_PASSWORD — API runs as least-privilege role only
     volumes:
       - ./certs:/app/certs:ro
     ports:

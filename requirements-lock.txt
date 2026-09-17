@@ -23,7 +23,6 @@ pydantic==2.13.5
 pydantic_core==2.46.5
 Pygments==2.21.0
 pytest==9.1.1
--e git+ssh://git@github.com/Amir2051/safenestt-ai-agency.git@62b07f54d05b94b8da91989859e3f220e09edc4b#egg=safenestt
 setuptools==84.0.0
 SQLAlchemy==2.0.54
 starlette==1.6.0

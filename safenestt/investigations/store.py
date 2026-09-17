@@ -148,16 +148,6 @@ class PersistentInvestigationStore:
             session.add(model)
             session.flush()
             
-            # Update investigation timestamp
-            from sqlalchemy import select as sa_select
-            inv = session.execute(
-                sa_select(InvestigationModel).where(
-                    InvestigationModel.investigation_id == evidence.investigation_id
-                )
-            ).scalar_one_or_none()
-            if inv:
-                inv.updated_at = datetime.now(UTC)
-            
             return evidence
     
     def list_evidence(self, investigation_id: str) -> list[EvidenceRecord]:
@@ -167,7 +157,6 @@ class PersistentInvestigationStore:
         # First verify the investigation belongs to this tenant
         inv = self.get_investigation(investigation_id)
         if inv is None:
-            # get_investigation already raises TenantIsolationError for cross-tenant
             return []
         
         with session_scope(tenant_id) as session:
@@ -214,6 +203,11 @@ class PersistentInvestigationStore:
     def list_findings(self, investigation_id: str) -> list[FindingRecord]:
         tenant_id = self._require_tenant()
         
+        # First verify the investigation belongs to this tenant
+        inv = self.get_investigation(investigation_id)
+        if inv is None:
+            return []
+        
         with session_scope(tenant_id) as session:
             from sqlalchemy import select
             results = session.execute(
@@ -259,62 +253,17 @@ class PersistentInvestigationStore:
             ]
 
 
-class PersistentInvestigationService:
-    """Service layer using PostgreSQL persistence."""
-    
-    def __init__(self, tenant_id: str | None = None):
-        self.store = PersistentInvestigationStore(tenant_id=tenant_id)
-    
-    def create(self, *, investigation_id: str, target: str, tenant_id: str, created_by: str | None = None, type: str = "domain") -> InvestigationRecord:
-        record = InvestigationRecord(
-            investigation_id=investigation_id,
-            tenant_id=tenant_id,
-            created_by=created_by,
-            target=target,
-            type=type,
-            status="QUEUED",
-        )
-        return self.store.create_investigation(record)
-    
-    def get_investigation(self, investigation_id: str) -> InvestigationRecord | None:
-        return self.store.get_investigation(investigation_id)
-    
-    def update_investigation(self, record: InvestigationRecord) -> InvestigationRecord:
-        return self.store.update_investigation(record)
-    
-    def add_evidence(self, evidence: EvidenceRecord) -> EvidenceRecord:
-        return self.store.add_evidence(evidence)
-    
-    def list_evidence(self, investigation_id: str) -> list[EvidenceRecord]:
-        return self.store.list_evidence(investigation_id)
-    
-    def add_finding(self, finding: FindingRecord) -> FindingRecord:
-        return self.store.add_finding(finding)
-    
-    def list_findings(self, investigation_id: str) -> list[FindingRecord]:
-        return self.store.list_findings(investigation_id)
-    
-    def list_investigations(self) -> list[InvestigationRecord]:
-        return self.store.list_investigations()
-
-
 def ensure_schema() -> None:
     """Create all tables if they don't exist using the app engine.
     
     NOTE: In production, schema is created by the `migrate` job which runs
     as the owner role. This function is for development/testing only.
-    The app engine can create tables because it owns them (created by same role).
     """
-    # Use the app engine (restricted role)
     engine = create_engine()
-    
-    # For development/testing: create tables if they don't exist
     Base.metadata.create_all(engine)
     
-    # RLS policies should have been applied by the migrate job
-    # If not, this will silently skip
     try:
         from safenestt.persistence.rls import apply_rls_policies
         apply_rls_policies(engine)
     except Exception:
-        pass  # Migrate job handles this in production
+        pass

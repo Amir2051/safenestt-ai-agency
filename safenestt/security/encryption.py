@@ -37,14 +37,42 @@ _DEFAULT_KEYS = {
 _MIN_KEY_LENGTH = 32
 
 
+def _has_sufficient_entropy(key: str) -> bool:
+    """Check if a key has sufficient entropy (not just repeated characters).
+    
+    Returns False if the key is mostly the same character repeated.
+    """
+    if len(key) < 8:
+        return False
+    
+    # Count unique characters
+    unique_chars = len(set(key))
+    
+    # A key with fewer than 5 unique characters out of 32+ is suspicious
+    if unique_chars < 5:
+        return False
+    
+    # Check for highly repetitive patterns (e.g., "AAAAAAAAAAAAAAAA")
+    from collections import Counter
+    char_counts = Counter(key)
+    most_common_count = char_counts.most_common(1)[0][1]
+    
+    # If the most common character makes up more than 50% of the key, it's weak
+    if most_common_count / len(key) > 0.5:
+        return False
+    
+    return True
+
+
 def _is_valid_key(key: str) -> bool:
-    """Validate that an encryption key meets production standards.
+    """Validate that an encryption key meets production security standards.
     
     Returns False if the key:
     - Is empty or None
     - Matches a known default/test pattern
     - Is too short
     - Contains common placeholder patterns
+    - Has insufficient entropy (repeated characters)
     """
     if not key or not isinstance(key, str):
         return False
@@ -59,10 +87,14 @@ def _is_valid_key(key: str) -> bool:
     if key_lower in _DEFAULT_KEYS:
         return False
     
-    # Check for common placeholder patterns
+    # Check for common placeholder patterns (regardless of length)
     for pattern in ["test", "dev", "default", "changeme", "secret", "placeholder", "demo", "sample"]:
-        if pattern in key_lower and len(key) < 44:
+        if pattern in key_lower:
             return False
+    
+    # Check entropy
+    if not _has_sufficient_entropy(key):
+        return False
     
     return True
 
@@ -77,7 +109,8 @@ def _get_fernet():
     if os.getenv("MODE") == "production" and not _is_valid_key(raw_key):
         raise RuntimeError(
             f"FATAL: SAFENESTT_ENCRYPTION_KEY is set but does not meet production security requirements. "
-            f"Key must be at least {_MIN_KEY_LENGTH} characters and not match a known default pattern. "
+            f"Key must be at least {_MIN_KEY_LENGTH} characters, have sufficient entropy, "
+            f"and not match a known default pattern. "
             f"Generate a strong key with: python -c \"from safenestt.security.encryption import generate_key; print(generate_key())\""
         )
     

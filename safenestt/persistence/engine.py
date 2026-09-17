@@ -25,11 +25,6 @@ def _get_db_password() -> str:
     return get_secret("SAFENESTT_DB_PASSWORD") or os.getenv("DB_PASSWORD", "safenestt_app_pass")
 
 
-def _get_owner_password() -> str:
-    """Get owner DB password dynamically. Only used by the migrate job."""
-    return get_secret("SAFENESTT_OWNER_PASSWORD") or os.getenv("POSTGRES_PASSWORD", "postgres")
-
-
 def _build_database_url() -> str:
     """Build DATABASE_URL dynamically."""
     return os.getenv(
@@ -41,25 +36,9 @@ def _build_database_url() -> str:
     )
 
 
-def _build_owner_database_url() -> str:
-    """Build OWNER_DATABASE_URL dynamically. Only used by the migrate job."""
-    return os.getenv(
-        "SAFENESTT_OWNER_DATABASE_URL",
-        os.getenv(
-            "OWNER_DATABASE_URL",
-            f"postgresql://postgres:{_get_owner_password()}@{_DB_HOST}:{_DB_PORT}/{_DB_NAME}",
-        ),
-    )
-
-
 _engine: Engine | None = None
 _sessionmaker: sessionmaker[Session] | None = None
 _owner_engine: Engine | None = None
-
-
-# Backward-compatible aliases for tests
-_DB_SSL_MODE = "verify-full"
-_DB_SSL_ROOT_CERT = os.path.join(os.path.dirname(__file__), "..", "..", "certs", "ca.crt")
 
 
 def _get_ssl_mode() -> str:
@@ -109,6 +88,28 @@ def get_sessionmaker() -> sessionmaker[Session] | None:
     return _sessionmaker
 
 
+def _build_owner_database_url() -> str:
+    """Build OWNER_DATABASE_URL dynamically. Only used by the migrate job.
+    
+    CRITICAL: Owner credentials are NEVER used by the always-running API.
+    This is only called by the migrate job which runs as a separate container.
+    No defaults are provided — must be explicitly set via environment.
+    """
+    owner_url = os.getenv("SAFENESTT_OWNER_DATABASE_URL") or os.getenv("OWNER_DATABASE_URL")
+    if owner_url:
+        return owner_url
+    
+    # No defaults for owner password — must be explicitly provided
+    owner_password = get_secret("SAFENESTT_OWNER_PASSWORD") or os.getenv("POSTGRES_PASSWORD")
+    if not owner_password:
+        raise RuntimeError(
+            "Owner credentials not configured. Set SAFENESTT_OWNER_DATABASE_URL "
+            "or SAFENESTT_OWNER_PASSWORD + POSTGRES_PASSWORD."
+        )
+    
+    return f"postgresql://postgres:{owner_password}@{_DB_HOST}:{_DB_PORT}/{_DB_NAME}"
+
+
 def get_owner_engine() -> Engine:
     global _owner_engine
     if _owner_engine is None:
@@ -150,3 +151,8 @@ def session_scope_bypass_rls() -> Generator[Session, None, None]:
         raise
     finally:
         session.close()
+
+
+# Backward-compatible aliases for tests
+_DB_SSL_MODE = "verify-full"
+_DB_SSL_ROOT_CERT = os.path.join(os.path.dirname(__file__), "..", "..", "certs", "ca.crt")

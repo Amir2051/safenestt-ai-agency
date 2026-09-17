@@ -1,6 +1,6 @@
 """API key lifecycle management: hashing, expiry, revocation.
 
-API keys are NEVER stored in plaintext — only SHA-256 hashes are kept.
+API keys are NEVER stored in plaintext — only salted SHA-256 hashes are kept.
 Each key has an optional expiry and can be revoked at any time.
 """
 from __future__ import annotations
@@ -35,8 +35,12 @@ def generate_api_key(prefix: str = "sn_live_") -> tuple[str, str]:
 
 
 def verify_api_key(raw_key: str, hashed_key: str) -> bool:
-    """Verify a raw API key against a stored hash."""
-    return secrets.compare_digest(_hash_key(raw_key), hashed_key)
+    """Verify a raw API key against a stored hash.
+    
+    Uses secrets.compare_digest() for timing-safe comparison.
+    """
+    computed = _hash_key(raw_key)
+    return secrets.compare_digest(computed, hashed_key)
 
 
 class RevocationList:
@@ -47,11 +51,12 @@ class RevocationList:
         self._load_from_env()
     
     def _load_from_env(self) -> None:
-        """Load revoked keys from environment variable (JSON list)."""
+        """Load revoked keys from environment variable (JSON list of HASHES)."""
         revoked_json = os.getenv("REVOKED_API_KEYS", "[]")
         try:
             revoked_list = json.loads(revoked_json)
-            self._revoked = {_hash_key(k) for k in revoked_list}
+            # Store hashes, not raw keys
+            self._revoked = set(revoked_list)
         except (json.JSONDecodeError, TypeError):
             self._revoked = set()
     
@@ -137,7 +142,8 @@ class APIKeyRegistry:
                 if datetime.now(UTC) > expiry:
                     return False, "", {"error": "key_expired"}
             except (ValueError, TypeError):
-                pass  # Invalid expiry format, treat as no expiry
+                # Invalid expiry format — treat as expired (fail closed)
+                return False, "", {"error": "key_expired"}
         
         return True, metadata["tenant_id"], metadata
     
