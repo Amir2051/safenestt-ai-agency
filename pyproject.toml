@@ -18,6 +18,13 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8",
+  "pip-audit",
+]
+kms-aws = ["boto3"]
+kms-gcp = ["google-cloud-secret-manager"]
+prod = [
+  "uvloop",
+  "httptools",
 ]
 
 [tool.setuptools.packages.find]

@@ -57,7 +57,7 @@ def get_secret(name: str, default: str | None = None, required: bool = False) ->
     aws_region = os.getenv("AWS_REGION")
     if aws_region:
         try:
-            import boto3
+            import boto3  # type: ignore[import-untyped]
             ssm = boto3.client("ssm", region_name=aws_region)
             response = ssm.get_parameter(
                 Name=f"/safenestt/{os.getenv('ENV', 'production')}/{name}",
@@ -73,7 +73,7 @@ def get_secret(name: str, default: str | None = None, required: bool = False) ->
     gcp_project = os.getenv("GCP_PROJECT")
     if gcp_project:
         try:
-            from google.cloud import secretmanager
+            from google.cloud import secretmanager  # type: ignore[import-untyped]
             client = secretmanager.SecretManagerServiceClient()
             secret_path = f"projects/{gcp_project}/secrets/{name}/versions/latest"
             response = client.access_secret_version(request={"name": secret_path})
