@@ -1,39 +1,50 @@
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import contextmanager
 from typing import Generator
 
 import sqlalchemy as _sqlalchemy
-from sqlalchemy import create_engine as _create_engine, Engine, event
+from sqlalchemy import create_engine as _create_engine, Engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from safenestt.persistence.rls import set_tenant_context
+from safenestt.security.secrets import get_secret
 
-# Application connects as non-owner role (RLS applies)
-# Password MUST come from env var, never hardcoded
-_DB_PASSWORD = os.getenv("SAFENESTT_DB_PASSWORD", os.getenv("DB_PASSWORD", ""))
-_DB_OWNER_PASSWORD = os.getenv("SAFENESTT_OWNER_PASSWORD", os.getenv("POSTGRES_PASSWORD", ""))
+logger = logging.getLogger(__name__)
 
+# Database connection settings from environment or secrets manager
+_DB_HOST = os.getenv("DB_HOST", "172.19.0.11")
+_DB_PORT = os.getenv("DB_PORT", "5432")
+_DB_NAME = os.getenv("DB_NAME", "safenestt_ai")
+
+# Passwords from secrets manager (with env fallback)
+_DB_PASSWORD = get_secret("SAFENESTT_DB_PASSWORD") or os.getenv("DB_PASSWORD", "")
+_DB_OWNER_PASSWORD = get_secret("SAFENESTT_OWNER_PASSWORD") or os.getenv("POSTGRES_PASSWORD", "postgres")
+
+# Allow full URL override via env (highest priority)
 _DATABASE_URL = os.getenv(
     "SAFENESTT_DATABASE_URL",
     os.getenv(
         "DATABASE_URL",
-        f"postgresql://safenestt_app:{_DB_PASSWORD}@172.19.0.11:5432/safenestt_ai" if _DB_PASSWORD else "postgresql://safenestt_app:***@172.19.0.11:5432/safenestt_ai",
+        f"postgresql://safenestt_app:{_DB_PASSWORD}@{_DB_HOST}:{_DB_PORT}/{_DB_NAME}" if _DB_PASSWORD else f"postgresql://safenestt_app:***@{_DB_HOST}:{_DB_PORT}/{_DB_NAME}",
     ),
 )
 
-# Owner connection for DDL (table creation/migration)
 _OWNER_DATABASE_URL = os.getenv(
     "SAFENESTT_OWNER_DATABASE_URL",
     os.getenv(
         "OWNER_DATABASE_URL",
-        f"postgresql://postgres:{_DB_OWNER_PASSWORD}@172.19.0.11:5432/safenestt_ai" if _DB_OWNER_PASSWORD else "postgresql://postgres:***@172.19.0.11:5432/safenestt_ai",
+        f"postgresql://postgres:{_DB_OWNER_PASSWORD}@{_DB_HOST}:{_DB_PORT}/{_DB_NAME}",
     ),
 )
 
-_DB_SSL_MODE = os.getenv("DB_SSL_MODE", "prefer")  # Try SSL first, fall back to plaintext if server doesn't support
+# SSL configuration
+_DB_SSL_MODE = os.getenv("DB_SSL_MODE", "prefer")
 _DB_SSL_ROOT_CERT = os.getenv("DB_SSL_ROOT_CERT", None)
+_DB_SSL_CLIENT_CERT = os.getenv("DB_SSL_CLIENT_CERT", None)
+_DB_SSL_CLIENT_KEY = os.getenv("DB_SSL_CLIENT_KEY", None)
 
 _engine: Engine | None = None
 _sessionmaker: sessionmaker[Session] | None = None
@@ -51,6 +62,10 @@ def _build_engine(url: str, **kwargs) -> Engine:
         connect_args["sslmode"] = _DB_SSL_MODE
         if _DB_SSL_ROOT_CERT:
             connect_args["sslrootcert"] = _DB_SSL_ROOT_CERT
+        if _DB_SSL_CLIENT_CERT:
+            connect_args["sslcert"] = _DB_SSL_CLIENT_CERT
+        if _DB_SSL_CLIENT_KEY:
+            connect_args["sslkey"] = _DB_SSL_CLIENT_KEY
     
     return _create_engine(url, connect_args=connect_args, **kwargs)
 
