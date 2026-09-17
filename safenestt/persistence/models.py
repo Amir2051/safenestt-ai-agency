@@ -220,3 +220,21 @@ class APIKeyAuditModel(Base):
     actor = mapped_column(Text, nullable=True)  # who performed the action
     details = mapped_column(JSON, nullable=True)
     created_at = mapped_column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+
+
+class RateLimitModel(Base):
+    """PostgreSQL-backed rate limit counters for multi-worker deployments."""
+    __tablename__ = "rate_limits"
+
+    id = mapped_column(Integer, primary_key=True)
+    scope = mapped_column(Text, nullable=False)
+    key = mapped_column(Text, nullable=False)
+    tokens = mapped_column(Integer, nullable=False)
+    window_start = mapped_column(DateTime, nullable=False)
+    window_seconds = mapped_column(Integer, nullable=False)
+    reset_at = mapped_column(DateTime, nullable=False)
+
+    __table_args__ = (
+        Index("ix_rate_limits_scope_key", "scope", "key", unique=True),
+        Index("ix_rate_limits_reset", "reset_at"),
+    )
