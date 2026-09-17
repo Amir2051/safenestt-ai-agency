@@ -130,12 +130,10 @@ def get_api_context(request: Request) -> tuple[str, str]:
         raise _to_api_error("missing_api_key", "X-API-Key header is required", 401)
     
     store = get_key_store()
-    is_valid, tenant_id, metadata = store.validate_key(api_key)
+    is_valid, tenant_id, key_fingerprint, metadata = store.validate_key(api_key)
     
     if is_valid:
-        from safenestt.security.api_keys import _hash_key
-        key_hash = _hash_key(api_key)
-        return key_hash, tenant_id
+        return tenant_id, key_fingerprint
     
     error = metadata.get("error", "invalid_key")
     if error == "key_revoked":

@@ -59,7 +59,7 @@ services:
         uvicorn safenestt.api:app --host 0.0.0.0 --port 8000
       "
     environment:
-      MODE: ${MODE:-development}
+      MODE: ${MODE:-production}
       HOST: 0.0.0.0
       PORT: 8000
       WORKERS: ${WORKERS:-2}

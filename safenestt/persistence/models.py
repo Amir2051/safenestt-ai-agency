@@ -208,3 +208,15 @@ class APIKeyModel(Base):
     __table_args__ = (
         Index("ix_api_keys_tenant_active", "tenant_id", "active"),
     )
+
+
+class APIKeyAuditModel(Base):
+    """Audit history for API key operations."""
+    __tablename__ = "api_key_audit"
+
+    id = mapped_column(Integer, primary_key=True)
+    api_key_id = mapped_column(Integer, ForeignKey("api_keys.id"), nullable=False)
+    action = mapped_column(Text, nullable=False)  # create, revoke, rotate, validate, expired
+    actor = mapped_column(Text, nullable=True)  # who performed the action
+    details = mapped_column(JSON, nullable=True)
+    created_at = mapped_column(DateTime, nullable=False, default=lambda: datetime.now(UTC))

@@ -1,4 +1,17 @@
-"""PostgreSQL-backed API key storage with Argon2id hashing."""
+"""PostgreSQL-backed API key storage with Argon2id hashing and audit logging.
+
+KEY DESIGN:
+- key_hash: Argon2id (memory-hard, constant-time verification)
+- key_fingerprint: SHA-256 (deterministic, for fast server-side lookup)
+- api_keys table: stores hashed keys, never plaintext
+- api_key_audit table: tracks all key lifecycle events
+
+PRODUCTION REQUIREMENTS:
+- All keys must be registered in PostgreSQL
+- No fallback to raw-key-as-tenant (rejected in all modes)
+- Revocation is immediate and persistent across all workers
+- Expiry is enforced at validation time (fail closed on parse errors)
+"""
 from __future__ import annotations
 
 import hashlib
@@ -10,14 +23,14 @@ from datetime import datetime, timedelta, UTC
 from typing import Any, Generator
 
 from safenestt.persistence.engine import create_engine, get_engine
-from safenestt.persistence.models import APIKeyModel
+from safenestt.persistence.models import APIKeyModel, APIKeyAuditModel
 
 logger = logging.getLogger(__name__)
 
 # Fixed pepper - read at module load
 _API_KEY_PEPPER = os.getenv("API_KEY_PEPPER", "safenestt-pepper-change-in-production")
 
-# Import argon2 at module level with proper error handling
+# Import argon2 at module level
 try:
     from argon2 import PasswordHasher
     from argon2.exceptions import VerifyMismatchError
@@ -44,10 +57,7 @@ def _compute_key_fingerprint(key: str) -> str:
 
 
 def _verify_key(key: str, key_hash: str) -> bool:
-    """Verify an API key against a stored hash (constant-time).
-    
-    Returns True if the key matches, False otherwise.
-    """
+    """Verify an API key against a stored hash (constant-time)."""
     if _ARGON2_AVAILABLE:
         try:
             return _PH.verify(key_hash, f"{_API_KEY_PEPPER}:{key}")
@@ -92,8 +102,19 @@ def _api_key_session() -> Generator:
         session.close()
 
 
+def _record_audit(session: Any, api_key_id: int, action: str, actor: str | None = None, details: dict | None = None) -> None:
+    """Record an audit event for an API key operation."""
+    audit = APIKeyAuditModel(
+        api_key_id=api_key_id,
+        action=action,
+        actor=actor or "system",
+        details=details or {},
+    )
+    session.add(audit)
+
+
 class APIKeyStore:
-    """PostgreSQL-backed API key store with Argon2id hashing."""
+    """PostgreSQL-backed API key store with Argon2id hashing and audit logging."""
     
     def create_key(
         self,
@@ -102,8 +123,12 @@ class APIKeyStore:
         name: str | None = None,
         expires_at: str | None = None,
         scopes: list[str] | None = None,
+        actor: str | None = None,
     ) -> tuple[str, str, str]:
-        """Create a new API key. Returns (raw_key, key_hash, key_fingerprint)."""
+        """Create a new API key. Returns (raw_key, key_hash, key_fingerprint).
+        
+        Records an audit event for the creation.
+        """
         if raw_key is None:
             raw_key, key_hash, fingerprint = generate_api_key()
         else:
@@ -130,11 +155,18 @@ class APIKeyStore:
             )
             session.add(model)
             session.flush()
+            
+            # Record audit event
+            _record_audit(session, model.id, "create", actor, {"tenant_id": tenant_id})
         
         return raw_key, key_hash, fingerprint
     
-    def revoke_key(self, raw_key: str) -> bool:
-        """Revoke an API key by its raw value."""
+    def revoke_key(self, raw_key: str, actor: str | None = None) -> bool:
+        """Revoke an API key by its raw value.
+        
+        Records an audit event for the revocation.
+        Returns True if the key was found and revoked, False otherwise.
+        """
         with _api_key_session() as session:
             candidates = session.query(APIKeyModel).filter(
                 APIKeyModel.active == True,
@@ -145,13 +177,21 @@ class APIKeyStore:
                     key_record.revoked = True
                     key_record.revoked_at = datetime.now(UTC)
                     key_record.active = False
+                    
+                    # Record audit event
+                    _record_audit(session, key_record.id, "revoke", actor)
                     session.flush()
                     return True
             
             return False
     
-    def validate_key(self, raw_key: str) -> tuple[bool, str, str, dict[str, Any]]:
-        """Validate an API key. Returns (is_valid, tenant_id, key_fingerprint, metadata)."""
+    def validate_key(self, raw_key: str, actor: str | None = None) -> tuple[bool, str, str, dict[str, Any]]:
+        """Validate an API key. Returns (is_valid, tenant_id, key_fingerprint, metadata).
+        
+        Records audit events for both successful and failed validations.
+        Checks ALL keys so revoked keys return key_revoked error.
+        Uses constant-time Argon2id verification.
+        """
         with _api_key_session() as session:
             now = datetime.now(UTC)
             all_keys = session.query(APIKeyModel).all()
@@ -159,29 +199,32 @@ class APIKeyStore:
             for key_record in all_keys:
                 if _verify_key(raw_key, key_record.key_hash):
                     if key_record.revoked:
+                        _record_audit(session, key_record.id, "validate_revoked", actor)
                         return False, "", "", {"error": "key_revoked"}
                     
-                    # Check expiry - handle both aware and naive datetimes
                     if key_record.expires_at:
                         try:
                             expires_at = key_record.expires_at
-                            # If offset-naive, assume UTC
                             if expires_at.tzinfo is None:
                                 from datetime import timezone
                                 expires_at = expires_at.replace(tzinfo=timezone.utc)
                             if datetime.now(UTC) > expires_at:
+                                _record_audit(session, key_record.id, "validate_expired", actor)
                                 return False, "", "", {"error": "key_expired"}
                         except (ValueError, TypeError):
-                            # Invalid expiry format — fail closed
+                            _record_audit(session, key_record.id, "validate_invalid_expiry", actor)
                             return False, "", "", {"error": "key_expired"}
                     
                     if not key_record.active:
+                        _record_audit(session, key_record.id, "validate_inactive", actor)
                         return False, "", "", {"error": "key_inactive"}
                     
                     fingerprint = _compute_key_fingerprint(raw_key)
                     
                     key_record.last_used_at = now
                     key_record.use_count = (key_record.use_count or 0) + 1
+                    
+                    _record_audit(session, key_record.id, "validate_success", actor)
                     session.flush()
                     
                     return True, key_record.tenant_id, fingerprint, {
@@ -191,16 +234,86 @@ class APIKeyStore:
                         "expires_at": key_record.expires_at,
                     }
             
+            # Don't record audit for not_found (no valid key_id)
             return False, "", "", {"error": "key_not_found"}
     
-    def rotate_key(self, old_raw_key: str, tenant_id: str) -> tuple[str, str, str]:
-        """Rotate an API key: create new, revoke old."""
-        is_valid, _, _, _ = self.validate_key(old_raw_key)
+    def rotate_key(self, old_raw_key: str, tenant_id: str, actor: str | None = None) -> tuple[str, str, str]:
+        """Rotate an API key: create new key, revoke old one.
+        
+        Records audit events for both revocation and creation.
+        """
+        is_valid, _, _, _ = self.validate_key(old_raw_key, actor)
         if not is_valid:
             raise ValueError("Invalid or expired key")
         
-        self.revoke_key(old_raw_key)
-        return self.create_key(tenant_id=tenant_id)
+        self.revoke_key(old_raw_key, actor)
+        return self.create_key(tenant_id=tenant_id, actor=actor)
+    
+    def list_keys(self, tenant_id: str) -> list[dict[str, Any]]:
+        """List all API keys for a tenant (without hashes)."""
+        with _api_key_session() as session:
+            keys = session.query(APIKeyModel).filter(
+                APIKeyModel.tenant_id == tenant_id,
+            ).all()
+            
+            return [
+                {
+                    "id": k.id,
+                    "name": k.name,
+                    "active": k.active,
+                    "revoked": k.revoked,
+                    "expires_at": k.expires_at,
+                    "scopes": k.scopes,
+                    "created_at": k.created_at,
+                    "last_used_at": k.last_used_at,
+                    "use_count": k.use_count,
+                }
+                for k in keys
+            ]
+    
+    def get_audit_history(self, api_key_id: int) -> list[dict[str, Any]]:
+        """Get audit history for an API key."""
+        with _api_key_session() as session:
+            events = session.query(APIKeyAuditModel).filter(
+                APIKeyAuditModel.api_key_id == api_key_id,
+            ).order_by(APIKeyAuditModel.created_at.desc()).all()
+            
+            return [
+                {
+                    "id": e.id,
+                    "action": e.action,
+                    "actor": e.actor,
+                    "details": e.details,
+                    "created_at": e.created_at,
+                }
+                for e in events
+            ]
+    
+    def cleanup_expired(self) -> int:
+        """Deactivate expired keys. Returns count of deactivated keys."""
+        with _api_key_session() as session:
+            now = datetime.now(UTC)
+            expired = session.query(APIKeyModel).filter(
+                APIKeyModel.active == True,
+            ).all()
+            
+            count = 0
+            for key in expired:
+                if key.expires_at:
+                    try:
+                        expires_at = key.expires_at
+                        if expires_at.tzinfo is None:
+                            from datetime import timezone
+                            expires_at = expires_at.replace(tzinfo=timezone.utc)
+                        if expires_at < now:
+                            key.active = False
+                            _record_audit(session, key.id, "cleanup_expired", "system")
+                            count += 1
+                    except (ValueError, TypeError):
+                        pass
+            
+            session.flush()
+            return count
 
 
 _key_store = APIKeyStore()
