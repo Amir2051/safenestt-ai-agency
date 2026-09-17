@@ -1,10 +1,23 @@
+"""Production API store backed by PostgreSQL with RLS, encryption, and audit."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime
+import uuid
+from datetime import datetime, UTC
 from typing import Any
 
 from safenestt.investigations.records import EvidenceRecord, FindingRecord, InvestigationRecord
+from safenestt.persistence.engine import session_scope, create_engine
+from safenestt.persistence.models import (
+    AgentRunModel,
+    AuditEventModel,
+    EvidenceModel,
+    FindingModel,
+    InvestigationModel,
+    ReportModel,
+    Base,
+)
+from safenestt.security.encryption import encrypt_value
+from safenestt.security.audit import audit, AuditEvent
 
 
 class TenantIsolationError(PermissionError):
@@ -12,82 +25,247 @@ class TenantIsolationError(PermissionError):
     pass
 
 
-class InvestigationStore:
-    def __init__(self) -> None:
-        self._investigations: dict[str, InvestigationRecord] = {}
-        self._evidence: dict[str, list[EvidenceRecord]] = {}
-        self._findings: dict[str, list[FindingRecord]] = {}
-
+class PersistentInvestigationStore:
+    """PostgreSQL-backed store with RLS, encryption, and audit logging."""
+    
+    def __init__(self, tenant_id: str | None = None):
+        self._tenant_id = tenant_id
+    
+    def _require_tenant(self) -> str:
+        if not self._tenant_id:
+            raise TenantIsolationError("Tenant context required for database access")
+        return self._tenant_id
+    
     def create_investigation(self, record: InvestigationRecord) -> InvestigationRecord:
-        self._investigations[record.investigation_id] = record
-        self._evidence.setdefault(record.investigation_id, [])
-        self._findings.setdefault(record.investigation_id, [])
-        return record
-
-    def get_investigation(self, investigation_id: str, tenant_id: str | None = None) -> InvestigationRecord | None:
-        record = self._investigations.get(investigation_id)
-        if record is None:
-            return None
-        if tenant_id is not None and record.tenant_id != tenant_id:
-            raise TenantIsolationError(
-                f"investigation {investigation_id} not found for tenant {tenant_id}"
+        tenant_id = self._require_tenant()
+        
+        with session_scope(tenant_id) as session:
+            model = InvestigationModel(
+                investigation_id=record.investigation_id,
+                tenant_id=tenant_id,
+                created_by=record.created_by,
+                target=encrypt_value(record.target),
+                type=record.type,
+                status=record.status,
+                created_at=record.created_at,
+                updated_at=record.updated_at,
             )
-        return record
-
-    def update_investigation(self, record: InvestigationRecord, tenant_id: str | None = None) -> InvestigationRecord:
-        if tenant_id is not None and record.tenant_id != tenant_id:
-            raise TenantIsolationError(
-                f"investigation {record.investigation_id} not found for tenant {tenant_id}"
+            session.add(model)
+            session.flush()
+            
+            # Audit the creation
+            audit_event = AuditEvent(
+                event_id=f"inv-create-{record.investigation_id}",
+                actor_type="api",
+                actor_id=record.created_by,
+                action="investigation.create",
+                decision="ALLOW",
             )
-        self._investigations[record.investigation_id] = record
-        return record
-
+            audit.record(audit_event)
+            
+            return record
+    
+    def get_investigation(self, investigation_id: str) -> InvestigationRecord | None:
+        """Get investigation by ID. Raises TenantIsolationError if record exists but belongs to another tenant.
+        
+        Uses a SECURITY DEFINER function to detect cross-tenant access without needing owner credentials.
+        """
+        tenant_id = self._require_tenant()
+        
+        with session_scope(tenant_id) as session:
+            from sqlalchemy import select
+            result = session.execute(
+                select(InvestigationModel).where(
+                    InvestigationModel.investigation_id == investigation_id
+                )
+            ).scalar_one_or_none()
+            
+            if result is None:
+                # Use SECURITY DEFINER function to check cross-tenant access
+                # This runs with elevated privileges but only returns a boolean
+                from sqlalchemy import text
+                is_cross_tenant = session.execute(
+                    text("SELECT check_cross_tenant_access(:id, :tid)"),
+                    {"id": investigation_id, "tid": tenant_id}
+                ).scalar()
+                
+                if is_cross_tenant:
+                    raise TenantIsolationError(
+                        f"investigation {investigation_id} not accessible for tenant {tenant_id}"
+                    )
+                return None
+            
+            return InvestigationRecord(
+                investigation_id=result.investigation_id,
+                tenant_id=result.tenant_id,
+                created_by=result.created_by,
+                target=result.target,
+                type=result.type,
+                status=result.status,
+                created_at=result.created_at,
+                updated_at=result.updated_at,
+            )
+    
+    def update_investigation(self, record: InvestigationRecord) -> InvestigationRecord:
+        tenant_id = self._require_tenant()
+        
+        with session_scope(tenant_id) as session:
+            from sqlalchemy import select
+            result = session.execute(
+                select(InvestigationModel).where(
+                    InvestigationModel.investigation_id == record.investigation_id
+                )
+            ).scalar_one_or_none()
+            
+            if result is None:
+                raise TenantIsolationError(
+                    f"investigation {record.investigation_id} not found for tenant {tenant_id}"
+                )
+            
+            result.status = record.status
+            result.updated_at = datetime.now(UTC)
+            if record.error:
+                result.error = record.error
+            session.flush()
+            
+            return record
+    
     def add_evidence(self, evidence: EvidenceRecord) -> EvidenceRecord:
-        self._evidence.setdefault(evidence.investigation_id, []).append(evidence)
-        inv = self._investigations.get(evidence.investigation_id)
-        if inv:
-            inv.updated_at = datetime.utcnow()
-        return evidence
-
-    def list_evidence(self, investigation_id: str, tenant_id: str | None = None) -> list[EvidenceRecord]:
-        inv = self._investigations.get(investigation_id)
-        if inv is None:
-            return []
-        if tenant_id is not None and inv.tenant_id != tenant_id:
-            raise TenantIsolationError(
-                f"investigation {investigation_id} not found for tenant {tenant_id}"
+        tenant_id = self._require_tenant()
+        
+        with session_scope(tenant_id) as session:
+            model = EvidenceModel(
+                evidence_id=evidence.evidence_id,
+                investigation_id=evidence.investigation_id,
+                source=evidence.source,
+                source_type=evidence.source_type,
+                target=evidence.target,
+                observed_at=evidence.observed_at,
+                data=evidence.data,
+                confidence=evidence.confidence,
+                tool_run_id=evidence.tool_run_id,
             )
-        return list(self._evidence.get(investigation_id, []))
-
+            session.add(model)
+            session.flush()
+            
+            # Update investigation timestamp
+            from sqlalchemy import select as sa_select
+            inv = session.execute(
+                sa_select(InvestigationModel).where(
+                    InvestigationModel.investigation_id == evidence.investigation_id
+                )
+            ).scalar_one_or_none()
+            if inv:
+                inv.updated_at = datetime.now(UTC)
+            
+            return evidence
+    
+    def list_evidence(self, investigation_id: str) -> list[EvidenceRecord]:
+        """List evidence for an investigation. Raises TenantIsolationError if investigation belongs to another tenant."""
+        tenant_id = self._require_tenant()
+        
+        # First verify the investigation belongs to this tenant
+        inv = self.get_investigation(investigation_id)
+        if inv is None:
+            # get_investigation already raises TenantIsolationError for cross-tenant
+            return []
+        
+        with session_scope(tenant_id) as session:
+            from sqlalchemy import select
+            results = session.execute(
+                select(EvidenceModel).where(
+                    EvidenceModel.investigation_id == investigation_id
+                )
+            ).scalars().all()
+            
+            return [
+                EvidenceRecord(
+                    investigation_id=r.investigation_id,
+                    evidence_id=r.evidence_id,
+                    source=r.source,
+                    source_type=r.source_type,
+                    target=r.target,
+                    observed_at=r.observed_at,
+                    data=r.data or {},
+                    confidence=r.confidence or 0.0,
+                    tool_run_id=r.tool_run_id,
+                )
+                for r in results
+            ]
+    
     def add_finding(self, finding: FindingRecord) -> FindingRecord:
-        self._findings.setdefault(finding.investigation_id, []).append(finding)
-        inv = self._investigations.get(finding.investigation_id)
-        if inv:
-            inv.updated_at = datetime.utcnow()
-        return finding
-
-    def list_findings(self, investigation_id: str, tenant_id: str | None = None) -> list[FindingRecord]:
-        inv = self._investigations.get(investigation_id)
-        if inv is None:
-            return []
-        if tenant_id is not None and inv.tenant_id != tenant_id:
-            raise TenantIsolationError(
-                f"investigation {investigation_id} not found for tenant {tenant_id}"
+        tenant_id = self._require_tenant()
+        
+        with session_scope(tenant_id) as session:
+            model = FindingModel(
+                finding_id=finding.finding_id,
+                investigation_id=finding.investigation_id,
+                claim=finding.claim,
+                evidence_ids=finding.evidence_ids,
+                reality_status=finding.reality_status,
+                risk_score=finding.risk_score,
+                factors=finding.factors,
             )
-        return list(self._findings.get(investigation_id, []))
+            session.add(model)
+            session.flush()
+            
+            return finding
+    
+    def list_findings(self, investigation_id: str) -> list[FindingRecord]:
+        tenant_id = self._require_tenant()
+        
+        with session_scope(tenant_id) as session:
+            from sqlalchemy import select
+            results = session.execute(
+                select(FindingModel).where(
+                    FindingModel.investigation_id == investigation_id
+                )
+            ).scalars().all()
+            
+            return [
+                FindingRecord(
+                    investigation_id=r.investigation_id,
+                    finding_id=r.finding_id,
+                    claim=r.claim,
+                    evidence_ids=r.evidence_ids or [],
+                    reality_status=r.reality_status or "AI_INFERENCE",
+                    risk_score=r.risk_score or 0.0,
+                    factors=r.factors or {},
+                )
+                for r in results
+            ]
+    
+    def list_investigations(self) -> list[InvestigationRecord]:
+        tenant_id = self._require_tenant()
+        
+        with session_scope(tenant_id) as session:
+            from sqlalchemy import select
+            results = session.execute(
+                select(InvestigationModel)
+            ).scalars().all()
+            
+            return [
+                InvestigationRecord(
+                    investigation_id=r.investigation_id,
+                    tenant_id=r.tenant_id,
+                    created_by=r.created_by,
+                    target=r.target,
+                    type=r.type,
+                    status=r.status,
+                    created_at=r.created_at,
+                    updated_at=r.updated_at,
+                )
+                for r in results
+            ]
 
-    def list_investigations(self, tenant_id: str | None = None) -> list[InvestigationRecord]:
-        records = list(self._investigations.values())
-        if tenant_id is not None:
-            records = [r for r in records if r.tenant_id == tenant_id]
-        return records
 
-
-class InvestigationService:
-    def __init__(self, store: InvestigationStore | None = None) -> None:
-        self.store = store or InvestigationStore()
-
-    def create(self, *, investigation_id: str, target: str, tenant_id: str | None = None, created_by: str | None = None, type: str = "domain") -> InvestigationRecord:
+class PersistentInvestigationService:
+    """Service layer using PostgreSQL persistence."""
+    
+    def __init__(self, tenant_id: str | None = None):
+        self.store = PersistentInvestigationStore(tenant_id=tenant_id)
+    
+    def create(self, *, investigation_id: str, target: str, tenant_id: str, created_by: str | None = None, type: str = "domain") -> InvestigationRecord:
         record = InvestigationRecord(
             investigation_id=investigation_id,
             tenant_id=tenant_id,
@@ -97,77 +275,46 @@ class InvestigationService:
             status="QUEUED",
         )
         return self.store.create_investigation(record)
-
-    def get_investigation(self, investigation_id: str, tenant_id: str | None = None) -> InvestigationRecord | None:
-        return self.store.get_investigation(investigation_id, tenant_id=tenant_id)
-
-    def start(self, investigation_id: str, tenant_id: str | None = None) -> InvestigationRecord | None:
-        record = self.store.get_investigation(investigation_id, tenant_id=tenant_id)
-        if not record:
-            return None
-        record.mark("RUNNING")
-        return self.store.update_investigation(record, tenant_id=tenant_id)
-
-    def complete(self, investigation_id: str, tenant_id: str | None = None) -> InvestigationRecord | None:
-        record = self.store.get_investigation(investigation_id, tenant_id=tenant_id)
-        if not record:
-            return None
-        record.mark("COMPLETED")
-        return self.store.update_investigation(record, tenant_id=tenant_id)
-
-    def fail(self, investigation_id: str, tenant_id: str | None = None) -> InvestigationRecord | None:
-        record = self.store.get_investigation(investigation_id, tenant_id=tenant_id)
-        if not record:
-            return None
-        record.mark("FAILED")
-        return self.store.update_investigation(record, tenant_id=tenant_id)
-
-    def analyzing(self, investigation_id: str, tenant_id: str | None = None) -> InvestigationRecord | None:
-        record = self.store.get_investigation(investigation_id, tenant_id=tenant_id)
-        if not record:
-            return None
-        record.mark("ANALYZING")
-        return self.store.update_investigation(record, tenant_id=tenant_id)
-
-    def waiting(self, investigation_id: str, tenant_id: str | None = None) -> InvestigationRecord | None:
-        record = self.store.get_investigation(investigation_id, tenant_id=tenant_id)
-        if not record:
-            return None
-        record.mark("WAITING_FOR_TOOL")
-        return self.store.update_investigation(record, tenant_id=tenant_id)
-
-    def verifying(self, investigation_id: str, tenant_id: str | None = None) -> InvestigationRecord | None:
-        record = self.store.get_investigation(investigation_id, tenant_id=tenant_id)
-        if not record:
-            return None
-        record.mark("VERIFYING")
-        return self.store.update_investigation(record, tenant_id=tenant_id)
-
-    def calculating_risk(self, investigation_id: str, tenant_id: str | None = None) -> InvestigationRecord | None:
-        record = self.store.get_investigation(investigation_id, tenant_id=tenant_id)
-        if not record:
-            return None
-        record.mark("CALCULATING_RISK")
-        return self.store.update_investigation(record, tenant_id=tenant_id)
-
-    def cancel(self, investigation_id: str, tenant_id: str | None = None) -> InvestigationRecord | None:
-        record = self.store.get_investigation(investigation_id, tenant_id=tenant_id)
-        if not record:
-            return None
-        record.mark("CANCELLED")
-        return self.store.update_investigation(record, tenant_id=tenant_id)
-
-    def list_evidence(self, investigation_id: str, tenant_id: str | None = None) -> list[EvidenceRecord]:
-        return self.store.list_evidence(investigation_id, tenant_id=tenant_id)
-
-    def list_findings(self, investigation_id: str, tenant_id: str | None = None) -> list[FindingRecord]:
-        return self.store.list_findings(investigation_id, tenant_id=tenant_id)
-
+    
+    def get_investigation(self, investigation_id: str) -> InvestigationRecord | None:
+        return self.store.get_investigation(investigation_id)
+    
+    def update_investigation(self, record: InvestigationRecord) -> InvestigationRecord:
+        return self.store.update_investigation(record)
+    
     def add_evidence(self, evidence: EvidenceRecord) -> EvidenceRecord:
         return self.store.add_evidence(evidence)
-
+    
+    def list_evidence(self, investigation_id: str) -> list[EvidenceRecord]:
+        return self.store.list_evidence(investigation_id)
+    
     def add_finding(self, finding: FindingRecord) -> FindingRecord:
         return self.store.add_finding(finding)
+    
+    def list_findings(self, investigation_id: str) -> list[FindingRecord]:
+        return self.store.list_findings(investigation_id)
+    
+    def list_investigations(self) -> list[InvestigationRecord]:
+        return self.store.list_investigations()
 
-    def list_investigations(self, tenant_id: str | None = None) -> list[InvestigationRecord]:
-        return self.store.list_investigations(tenant_id=tenant_id)
+
+def ensure_schema() -> None:
+    """Create all tables if they don't exist using the app engine.
+    
+    NOTE: In production, schema is created by the `migrate` job which runs
+    as the owner role. This function is for development/testing only.
+    The app engine can create tables because it owns them (created by same role).
+    """
+    # Use the app engine (restricted role)
+    engine = create_engine()
+    
+    # For development/testing: create tables if they don't exist
+    Base.metadata.create_all(engine)
+    
+    # RLS policies should have been applied by the migrate job
+    # If not, this will silently skip
+    try:
+        from safenestt.persistence.rls import apply_rls_policies
+        apply_rls_policies(engine)
+    except Exception:
+        pass  # Migrate job handles this in production

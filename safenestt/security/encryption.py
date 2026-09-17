@@ -10,7 +10,6 @@ Sensitive fields that should be encrypted:
 - AgentRunModel.inputs/outputs (agent I/O)
 - ReportModel.draft (report content)
 """
-
 from __future__ import annotations
 
 import base64
@@ -21,18 +20,71 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Encryption key loaded from environment — never stored in DB
-_ENCRYPTION_KEY = os.getenv("SAFENESTT_ENCRYPTION_KEY")
+# Default/public key patterns that MUST NEVER be used in production
+# These are well-known test keys that should be rejected
+_DEFAULT_KEYS = {
+    "test", "testing", "test-key", "test_key", "testkey",
+    "dev", "development", "dev-key", "dev_key", "devkey",
+    "default", "default-key", "default_key", "defaultkey",
+    "placeholder", "sample", "demo",
+    "00000000000000000000000000000000",
+    "changeme", "change-me", "change_me",
+    "secret", "my-secret", "my_secret",
+    "12345", "12345678", "password",
+}
+
+# Minimum key length (Fernet keys are 44 chars base64-encoded = 32 bytes)
+_MIN_KEY_LENGTH = 32
+
+
+def _is_valid_key(key: str) -> bool:
+    """Validate that an encryption key meets production standards.
+    
+    Returns False if the key:
+    - Is empty or None
+    - Matches a known default/test pattern
+    - Is too short
+    - Contains common placeholder patterns
+    """
+    if not key or not isinstance(key, str):
+        return False
+    
+    key = key.strip()
+    
+    if len(key) < _MIN_KEY_LENGTH:
+        return False
+    
+    # Check against known default patterns
+    key_lower = key.lower()
+    if key_lower in _DEFAULT_KEYS:
+        return False
+    
+    # Check for common placeholder patterns
+    for pattern in ["test", "dev", "default", "changeme", "secret", "placeholder", "demo", "sample"]:
+        if pattern in key_lower and len(key) < 44:
+            return False
+    
+    return True
 
 
 def _get_fernet():
     """Get Fernet instance from the configured key."""
-    if not _ENCRYPTION_KEY:
+    raw_key = os.getenv("SAFENESTT_ENCRYPTION_KEY")
+    if not raw_key:
         return None
+    
+    # In production, reject default/weak keys
+    if os.getenv("MODE") == "production" and not _is_valid_key(raw_key):
+        raise RuntimeError(
+            f"FATAL: SAFENESTT_ENCRYPTION_KEY is set but does not meet production security requirements. "
+            f"Key must be at least {_MIN_KEY_LENGTH} characters and not match a known default pattern. "
+            f"Generate a strong key with: python -c \"from safenestt.security.encryption import generate_key; print(generate_key())\""
+        )
+    
     try:
         from cryptography.fernet import Fernet
         # Ensure key is valid Fernet key (32 bytes base64-encoded)
-        key = _ENCRYPTION_KEY.strip()
+        key = raw_key.strip()
         # If key is raw bytes, base64 encode it
         if len(key) == 32:
             key = base64.urlsafe_b64encode(key.encode()).decode()
@@ -48,7 +100,9 @@ def encrypt_value(value: Any) -> str | None:
         return None
     fernet = _get_fernet()
     if fernet is None:
-        # Encryption not configured — store plaintext (dev mode)
+        # Encryption not configured — store plaintext (dev mode only)
+        if os.getenv("MODE") == "production":
+            raise RuntimeError("Cannot store unencrypted data in production")
         logger.warning("Encryption key not configured, storing plaintext")
         return value if isinstance(value, str) else json.dumps(value)
     try:

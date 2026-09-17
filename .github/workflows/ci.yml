@@ -54,7 +54,7 @@ jobs:
       - name: Security scan (pip audit)
         run: |
           pip install pip-audit
-          pip-audit --strict || true
+          pip-audit --strict
 
   build:
     needs: test

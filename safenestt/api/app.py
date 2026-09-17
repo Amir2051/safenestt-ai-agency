@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request, Query
+from fastapi import FastAPI, HTTPException, Request, Query, Depends
 from pydantic import BaseModel, Field, validator
 from typing import Any, Annotated
 import os
@@ -7,23 +7,34 @@ import logging
 
 from safenestt.investigations.investigator import run_investigation
 from safenestt.investigations.records import EvidenceRecord, FindingRecord, InvestigationRecord
-from safenestt.investigations.store import InvestigationService, TenantIsolationError
+from safenestt.investigations.store import (
+    PersistentInvestigationService,
+    TenantIsolationError,
+    ensure_schema,
+)
 from safenestt.model.registry import GeminiProvider, ModelProvider, OllamaProvider, OpenAICompatibleProvider
 from safenestt.security.encryption import is_encryption_enabled
 from safenestt.security.rate_limit import RateLimitService, RateLimitScope
+from safenestt.security.api_keys import get_key_registry
 
 logger = logging.getLogger(__name__)
 
+
+def _validate_production_security() -> None:
+    """Fail-closed: refuse to start in production without encryption key."""
+    if os.getenv("MODE") == "production":
+        if not is_encryption_enabled():
+            raise RuntimeError(
+                "FATAL: SAFENESTT_ENCRYPTION_KEY is not set. "
+                "Refusing to start in production without encryption at rest. "
+                "Generate a key with: python -c \"from safenestt.security.encryption import generate_key; print(generate_key())\""
+            )
+
+
+_validate_production_security()
+
 app = FastAPI(title="SafeNestT AI Engine", version="0.1.0")
-_service_instance: InvestigationService | None = None
 _rate_limiter = RateLimitService()
-
-
-def _get_service() -> InvestigationService:
-    global _service_instance
-    if _service_instance is None:
-        _service_instance = InvestigationService()
-    return _service_instance
 
 
 def _resolve_model_provider() -> ModelProvider | None:
@@ -57,13 +68,6 @@ class TargetObject(BaseModel):
 class InvestigationCreateRequest(BaseModel):
     target: TargetObject
     investigation_type: str
-    tenant_id: str = Field(..., min_length=1, description="Tenant identifier is required")
-
-    @validator("tenant_id")
-    def validate_tenant_id(cls, v):
-        if not v or not v.strip():
-            raise ValueError("tenant_id is required and cannot be empty")
-        return v.strip()
 
 
 class InvestigationStartResponse(BaseModel):
@@ -93,29 +97,71 @@ def _handle_tenant_isolation(exc: TenantIsolationError) -> HTTPException:
     return _to_api_error("tenant_access_denied", str(exc), 403)
 
 
-def _enforce_rate_limit(request: Request, tenant_id: str) -> None:
-    """Enforce per-tenant rate limiting."""
-    # Limit: 10 requests per minute per tenant for investigation creation
+def _enforce_rate_limit(request: Request, api_key: str) -> None:
+    """Enforce per-API-key rate limiting."""
     if request.method == "POST" and "/investigations" in request.url.path:
         result = _rate_limiter.enforce(
-            scope=RateLimitScope.ORGANIZATION,
-            key=tenant_id,
+            scope=RateLimitScope.API_KEY,
+            key=api_key,
             limit=int(os.getenv("RATE_LIMIT_INVESTIGATIONS_PER_MINUTE", "10")),
             window_seconds=60,
         )
         if not result.allowed:
             raise _to_api_error("rate_limit_exceeded", f"Rate limit exceeded: {result.detail}", 429)
     
-    # Limit: 30 requests per minute per tenant for OpenRouter-backed endpoints (investigation start)
     if request.method == "POST" and "/start" in request.url.path:
         result = _rate_limiter.enforce(
-            scope=RateLimitScope.ORGANIZATION,
-            key=f"{tenant_id}:start",
+            scope=RateLimitScope.API_KEY,
+            key=f"{api_key}:start",
             limit=int(os.getenv("RATE_LIMIT_START_PER_MINUTE", "30")),
             window_seconds=60,
         )
         if not result.allowed:
             raise _to_api_error("rate_limit_exceeded", f"Rate limit exceeded: {result.detail}", 429)
+
+
+def get_tenant_id(request: Request) -> str:
+    """Extract and validate tenant ID from API key header.
+    
+    Validates the API key against the registry (hashed, expiry, revocation).
+    In production, unregistered keys are rejected.
+    In development/testing, unknown keys fall back to using the key as tenant_id.
+    """
+    api_key = request.headers.get("X-API-Key")
+    if not api_key:
+        raise _to_api_error("missing_api_key", "X-API-Key header is required", 401)
+    
+    # Validate against registry (checks hash, expiry, revocation)
+    registry = get_key_registry()
+    is_valid, tenant_id, metadata = registry.validate_key(api_key)
+    
+    if is_valid:
+        return tenant_id
+    
+    # In production, reject any unregistered/invalid key
+    if os.getenv("MODE") == "production":
+        error = metadata.get("error", "invalid_key")
+        if error == "key_revoked":
+            raise _to_api_error("key_revoked", "This API key has been revoked", 401)
+        elif error == "key_expired":
+            raise _to_api_error("key_expired", "This API key has expired", 401)
+        else:
+            raise _to_api_error("invalid_key", "Invalid API key", 401)
+    
+    # In dev/testing: fall back to using the key as the tenant_id
+    # This preserves backward compatibility with existing tests
+    logger.warning("Using raw API key as tenant_id (dev mode): %s...", api_key[:8])
+    return api_key
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database schema on startup."""
+    try:
+        ensure_schema()
+        logger.info("Database schema initialized")
+    except Exception as exc:
+        logger.warning("Could not initialize database schema: %s", exc)
 
 
 @app.middleware("http")
@@ -154,13 +200,18 @@ def health() -> dict[str, Any]:
 
 
 @app.post("/v1/investigations", response_model=dict)
-def create_investigation(payload: InvestigationCreateRequest, request: Request) -> dict[str, Any]:
-    _enforce_rate_limit(request, payload.tenant_id)
-    service = _get_service()
+def create_investigation(
+    payload: InvestigationCreateRequest,
+    request: Request,
+    tenant_id: str = Depends(get_tenant_id),
+) -> dict[str, Any]:
+    api_key = request.headers.get("X-API-Key", "")
+    _enforce_rate_limit(request, api_key)
+    service = PersistentInvestigationService(tenant_id=tenant_id)
     record = service.create(
         investigation_id=__import__("uuid").uuid4().hex,
         target=payload.target.value,
-        tenant_id=payload.tenant_id,
+        tenant_id=tenant_id,
         created_by=None,
         type=payload.investigation_type,
     )
@@ -170,11 +221,16 @@ def create_investigation(payload: InvestigationCreateRequest, request: Request) 
 
 
 @app.post("/v1/investigations/{investigation_id}/start", response_model=dict)
-def start_investigation(investigation_id: str, request: Request, tenant_id: Annotated[str, Query(..., min_length=1)] = ...) -> dict[str, Any]:
-    _enforce_rate_limit(request, tenant_id)
-    service = _get_service()
+def start_investigation(
+    investigation_id: str,
+    request: Request,
+    tenant_id: str = Depends(get_tenant_id),
+) -> dict[str, Any]:
+    api_key = request.headers.get("X-API-Key", "")
+    _enforce_rate_limit(request, api_key)
+    service = PersistentInvestigationService(tenant_id=tenant_id)
     try:
-        record = service.get_investigation(investigation_id, tenant_id=tenant_id)
+        record = service.store.get_investigation(investigation_id)
     except TenantIsolationError as exc:
         raise _handle_tenant_isolation(exc)
     if not record:
@@ -188,23 +244,26 @@ def start_investigation(investigation_id: str, request: Request, tenant_id: Anno
             tenant_id=record.tenant_id,
             created_by=record.created_by,
             model_provider=_resolve_model_provider(),
-            store=service,
+            store=service.store,
         )
     except TenantIsolationError as exc:
         raise _handle_tenant_isolation(exc)
     except Exception as exc:
-        service.fail(investigation_id, tenant_id=tenant_id)
+        service.store.update_investigation(record)
         raise _to_api_error("investigation_failed", str(exc), 500)
     if result.get("status") == "FAILED":
-        raise _to_api_error(result.get("error", {}).get("code", "investigation_failed"), result.get("error", {}).get("message", "investigation_failed"), 500)
+        return result  # Return 200 with failure details in body
     return result
 
 
 @app.get("/v1/investigations/{investigation_id}", response_model=dict)
-def get_investigation(investigation_id: str, tenant_id: Annotated[str, Query(..., min_length=1)] = ...) -> dict[str, Any]:
-    service = _get_service()
+def get_investigation(
+    investigation_id: str,
+    tenant_id: str = Depends(get_tenant_id),
+) -> dict[str, Any]:
+    service = PersistentInvestigationService(tenant_id=tenant_id)
     try:
-        record = service.get_investigation(investigation_id, tenant_id=tenant_id)
+        record = service.store.get_investigation(investigation_id)
     except TenantIsolationError as exc:
         raise _handle_tenant_isolation(exc)
     if not record:
@@ -213,36 +272,45 @@ def get_investigation(investigation_id: str, tenant_id: Annotated[str, Query(...
 
 
 @app.get("/v1/investigations/{investigation_id}/evidence", response_model=list[dict[str, Any]])
-def get_investigation_evidence(investigation_id: str, tenant_id: Annotated[str, Query(..., min_length=1)] = ...) -> list[dict[str, Any]]:
-    service = _get_service()
+def get_investigation_evidence(
+    investigation_id: str,
+    tenant_id: str = Depends(get_tenant_id),
+) -> list[dict[str, Any]]:
+    service = PersistentInvestigationService(tenant_id=tenant_id)
     try:
-        evidence = service.list_evidence(investigation_id, tenant_id=tenant_id)
+        evidence = service.store.list_evidence(investigation_id)
     except TenantIsolationError as exc:
         raise _handle_tenant_isolation(exc)
     return [_record_to_dict(item) for item in evidence]
 
 
 @app.get("/v1/investigations/{investigation_id}/findings", response_model=list[dict[str, Any]])
-def get_investigation_findings(investigation_id: str, tenant_id: Annotated[str, Query(..., min_length=1)] = ...) -> list[dict[str, Any]]:
-    service = _get_service()
+def get_investigation_findings(
+    investigation_id: str,
+    tenant_id: str = Depends(get_tenant_id),
+) -> list[dict[str, Any]]:
+    service = PersistentInvestigationService(tenant_id=tenant_id)
     try:
-        findings = service.list_findings(investigation_id, tenant_id=tenant_id)
+        findings = service.store.list_findings(investigation_id)
     except TenantIsolationError as exc:
         raise _handle_tenant_isolation(exc)
     return [_record_to_dict(item) for item in findings]
 
 
 @app.get("/v1/investigations/{investigation_id}/report", response_model=dict)
-def get_investigation_report(investigation_id: str, tenant_id: Annotated[str, Query(..., min_length=1)] = ...) -> dict[str, Any]:
-    service = _get_service()
+def get_investigation_report(
+    investigation_id: str,
+    tenant_id: str = Depends(get_tenant_id),
+) -> dict[str, Any]:
+    service = PersistentInvestigationService(tenant_id=tenant_id)
     try:
-        record = service.get_investigation(investigation_id, tenant_id=tenant_id)
+        record = service.store.get_investigation(investigation_id)
     except TenantIsolationError as exc:
         raise _handle_tenant_isolation(exc)
     if not record:
         raise _to_api_error("not_found", "investigation_not_found", 404)
-    evidence = service.list_evidence(investigation_id, tenant_id=tenant_id)
-    findings = service.list_findings(investigation_id, tenant_id=tenant_id)
+    evidence = service.store.list_evidence(investigation_id)
+    findings = service.store.list_findings(investigation_id)
     return {
         "investigation_id": investigation_id,
         "status": record.status,

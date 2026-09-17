@@ -6,7 +6,7 @@ from typing import Any
 
 from safenestt.investigations.records import EvidenceRecord, FindingRecord, InvestigationRecord, InvalidStatusError
 from safenestt.investigations.risk import calculate_risk
-from safenestt.investigations.store import InvestigationService, TenantIsolationError
+from safenestt.investigations.store import PersistentInvestigationService, TenantIsolationError
 from safenestt.investigations.reality import RealityChecker
 from safenestt.model.provider import ModelProvider, ModelRequest, ModelResponse
 from safenestt.registry import AgentRecord, AgentRegistry, AgentStatus, RiskLevel
@@ -76,17 +76,17 @@ def _parse_model_json(response: ModelResponse) -> dict[str, Any]:
     return {"plan": ["dns.lookup.lookup"], "findings": [{"claim": content[:240]}], "finished": True}
 
 
-def run_investigation(*, investigation_id: str, target: str, tenant_id: str | None = None, created_by: str | None = None, model_provider: ModelProvider | None = None, store: InvestigationService | None = None, dry_run: bool = False) -> dict[str, Any]:
-    store = store or InvestigationService()
+def run_investigation(*, investigation_id: str, target: str, tenant_id: str | None = None, created_by: str | None = None, model_provider: ModelProvider | None = None, store: PersistentInvestigationService | None = None, dry_run: bool = False) -> dict[str, Any]:
+    store = store or PersistentInvestigationService(tenant_id=tenant_id)
     permission_manager = PermissionManager()
     pipeline = SecurityPipeline(permission_manager=permission_manager, approval_service=ApprovalService(), rate_limit_service=RateLimitService(), audit_logger=AuditLogger())
     tool_interface = ToolInterface(permission_manager=permission_manager)
-    checker = RealityChecker(evidence_lookup=lambda investigation_id, evidence_id: next((e for e in store.list_evidence(investigation_id, tenant_id=tenant_id) if e.evidence_id == evidence_id), None))
+    checker = RealityChecker(evidence_lookup=lambda investigation_id, evidence_id: next((e for e in store.list_evidence(investigation_id) if e.evidence_id == evidence_id), None))
     agent = AgentRecord(agent_id="investigator", name="Investigator", enabled=True, status=AgentStatus.ACTIVE, capabilities=["tools.dns.lookup.lookup"], risk_level=RiskLevel.LOW)
 
     # Get or create the investigation record with tenant isolation
     try:
-        record = store.get_investigation(investigation_id, tenant_id=tenant_id)
+        record = store.get_investigation(investigation_id)
     except TenantIsolationError:
         record = None
     if not record:
@@ -95,9 +95,9 @@ def run_investigation(*, investigation_id: str, target: str, tenant_id: str | No
     elif record.status in {"FAILED", "CANCELLED"}:
         record.mark("QUEUED")
         record.error = None
-        record = store.store.update_investigation(record, tenant_id=tenant_id)
+        record = store.update_investigation(record)
     record.mark("RUNNING")
-    record = store.store.update_investigation(record, tenant_id=tenant_id)
+    record = store.update_investigation(record)
 
     provider = model_provider or ModelProvider()
     model_error: dict[str, Any] | None = None
@@ -110,7 +110,7 @@ def run_investigation(*, investigation_id: str, target: str, tenant_id: str | No
             record.mark("FAILED")
         except InvalidStatusError:
             pass
-        store.store.update_investigation(record, tenant_id=tenant_id)
+        store.update_investigation(record)
         return {
             "investigation_id": investigation_id,
             "status": record.status,
@@ -154,7 +154,7 @@ def run_investigation(*, investigation_id: str, target: str, tenant_id: str | No
             record.mark("FAILED")
         except InvalidStatusError:
             pass
-        store.store.update_investigation(record, tenant_id=tenant_id)
+        store.update_investigation(record)
         return {
             "investigation_id": investigation_id,
             "status": record.status,
@@ -225,12 +225,12 @@ def run_investigation(*, investigation_id: str, target: str, tenant_id: str | No
         store.add_finding(fallback)
 
     record.mark("VERIFYING")
-    record = store.store.update_investigation(record, tenant_id=tenant_id)
+    record = store.update_investigation(record)
     record.mark("CALCULATING_RISK")
-    record = store.store.update_investigation(record, tenant_id=tenant_id)
+    record = store.update_investigation(record)
     risk = calculate_risk(findings)
     record.mark("COMPLETED")
-    record = store.store.update_investigation(record, tenant_id=tenant_id)
+    record = store.update_investigation(record)
 
     return {
         "investigation_id": investigation_id,

@@ -14,6 +14,7 @@ class RateLimitScope(str):
     TOOL = "tool"
     PROVIDER = "provider"
     ORGANIZATION = "organization"
+    API_KEY = "api_key"  # NEW: per-API-key rate limiting
 
 
 class RateLimitDecision(str):

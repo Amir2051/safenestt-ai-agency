@@ -87,7 +87,7 @@ class FindingModel(Base):
     finding_id = mapped_column(Text, unique=True, nullable=False, index=True)
     investigation_id = mapped_column(Text, ForeignKey("investigations.investigation_id"), nullable=False, index=True)
     agent = mapped_column(Text, nullable=True)
-    finding_type = mapped_column(Text, nullable=False)
+    finding_type = mapped_column(Text, nullable=True)  # Optional - for future use
     claim = mapped_column(Text, nullable=True)
     severity = mapped_column(Text, nullable=True)
     confidence = mapped_column(Float, nullable=False, default=0.0)
