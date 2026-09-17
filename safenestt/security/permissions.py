@@ -40,12 +40,17 @@ class PermissionManager:
     def _parse_capability(self, capability: str) -> tuple[str, str | None]:
         if not isinstance(capability, str) or not capability.strip():
             return "", None
-        if capability.startswith("tools."):
-            parts = capability.split(".", 2)
-            if len(parts) != 3 or not parts[1] or not parts[2]:
-                return capability, None
-            return capability, f"tools.{parts[1]}.{parts[2]}"
-        return capability, capability
+        if not capability.startswith("tools."):
+            return capability, capability
+        parts = capability.split(".")
+        if len(parts) < 3 or not parts[1] or not parts[-1]:
+            return capability, None
+        if len(parts) == 3:
+            required_permission = f"{parts[0]}.{parts[1]}.{parts[2]}"
+            return capability, required_permission
+        tool_id = ".".join(parts[1:-1])
+        action = parts[-1]
+        return capability, f"tools.{tool_id}.{action}"
 
     def _load_agent(self, agent: AgentRecord | None) -> tuple[AgentRecord | None, str | None, bool]:
         if agent is None:

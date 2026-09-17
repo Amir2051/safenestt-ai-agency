@@ -79,7 +79,7 @@ class ToolInterface:
     def authorize(self, agent: AgentRecord | None, capability: str, payload: dict[str, Any] | None = None) -> AuthorizationDecision:
         return self.permission_manager.authorize(agent, capability)
 
-    def execute(self, agent: AgentRecord | None, capability: str, payload: dict[str, Any], manifest: ToolManifest | None = None, adapter: Adapter | None = None) -> dict[str, Any]:
+    def execute(self, agent: AgentRecord | None, capability: str, payload: dict[str, Any], manifest: ToolManifest | None = None, adapter: Any = None) -> dict[str, Any]:
         validation = self.validate(manifest, capability, payload)
         if validation.decision != "ALLOW":
             return {

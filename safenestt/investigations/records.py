@@ -59,8 +59,8 @@ class InvestigationRecord:
         "VERIFYING": {"CALCULATING_RISK", "FAILED", "CANCELLED"},
         "CALCULATING_RISK": {"COMPLETED", "FAILED", "CANCELLED"},
         "COMPLETED": set(),
-        "FAILED": set(),
-        "CANCELLED": set(),
+        "FAILED": {"QUEUED"},
+        "CANCELLED": {"QUEUED"},
     }
 
     def __init__(self, investigation_id: str, tenant_id: str | None = None, created_by: str | None = None, target: str | None = None, type: str | None = None, status: str = "QUEUED", created_at: datetime | None = None, updated_at: datetime | None = None, error: dict[str, Any] | None = None) -> None:

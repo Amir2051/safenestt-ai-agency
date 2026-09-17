@@ -1012,7 +1012,7 @@ def test_create_investigation_api():
     from fastapi.testclient import TestClient
     from safenestt.api.app import app
     client = TestClient(app)
-    resp = client.post("/v1/investigations", json={"target": {"type": "domain", "value": "example.com"}, "investigation_type": "cybersecurity"})
+    resp = client.post("/v1/investigations", json={"target": {"type": "domain", "value": "example.com"}, "investigation_type": "cybersecurity", "tenant_id": "org-1"})
     assert resp.status_code == 200
     body = resp.json()
     assert "investigation_id" in body
@@ -1023,16 +1023,16 @@ def test_start_investigation_sets_flow_and_idempotency():
     from fastapi.testclient import TestClient
     from safenestt.api.app import app
     client = TestClient(app)
-    create = client.post("/v1/investigations", json={"target": {"type": "domain", "value": "google.com"}, "investigation_type": "cybersecurity"})
+    create = client.post("/v1/investigations", json={"target": {"type": "domain", "value": "google.com"}, "investigation_type": "cybersecurity", "tenant_id": "org-1"})
     investigation_id = create.json()["investigation_id"]
-    first = client.post(f"/v1/investigations/{investigation_id}/start")
+    first = client.post(f"/v1/investigations/{investigation_id}/start?tenant_id=org-1")
     assert first.status_code == 200
     body = first.json()
     assert body["status"] == "COMPLETED"
     assert len(body["evidence"]) >= 1
     assert len(body["findings"]) >= 1
     assert body["findings"][0]["evidence_ids"]
-    second = client.post(f"/v1/investigations/{investigation_id}/start")
+    second = client.post(f"/v1/investigations/{investigation_id}/start?tenant_id=org-1")
     assert second.status_code == 409
 
 
@@ -1040,9 +1040,9 @@ def test_get_investigation_api():
     from fastapi.testclient import TestClient
     from safenestt.api.app import app
     client = TestClient(app)
-    create = client.post("/v1/investigations", json={"target": {"type": "domain", "value": "example.com"}, "investigation_type": "cybersecurity"})
+    create = client.post("/v1/investigations", json={"target": {"type": "domain", "value": "example.com"}, "investigation_type": "cybersecurity", "tenant_id": "org-1"})
     investigation_id = create.json()["investigation_id"]
-    resp = client.get(f"/v1/investigations/{investigation_id}")
+    resp = client.get(f"/v1/investigations/{investigation_id}?tenant_id=org-1")
     assert resp.status_code == 200
     assert resp.json()["investigation_id"] == investigation_id
 
@@ -1083,21 +1083,62 @@ def test_missing_evidence_reference_is_rejected():
 
 
 def test_cross_tenant_investigation_access_denied():
-    from safenestt.investigations.store import InvestigationService
+    from safenestt.investigations.store import InvestigationService, TenantIsolationError
     service = InvestigationService()
     service.create(investigation_id="inv-1", target="example.com", tenant_id="org-1")
-    # tenant scoping enforced in API layer; service layer is intentionally unscoped for in-memory tests
+    # Same tenant can access
+    record = service.get_investigation("inv-1", tenant_id="org-1")
+    assert record is not None
+    assert record.tenant_id == "org-1"
+    # Different tenant must be denied
+    try:
+        service.get_investigation("inv-1", tenant_id="org-2")
+        raise AssertionError("Expected TenantIsolationError for cross-tenant access")
+    except TenantIsolationError:
+        pass
 
 
 def test_cross_tenant_evidence_access_denied():
-    from safenestt.investigations.store import InvestigationService
+    from safenestt.investigations.store import InvestigationService, TenantIsolationError
     from safenestt.investigations.records import EvidenceRecord
     from datetime import datetime
     service = InvestigationService()
     service.create(investigation_id="inv-1", target="example.com", tenant_id="org-1")
     evidence = EvidenceRecord(investigation_id="inv-1", evidence_id="ev-1", source="dns", source_type="tool", target="example.com", observed_at=datetime.utcnow(), data={"records": ["1.1.1.1"]}, tool_run_id="run-1")
     service.add_evidence(evidence)
-    assert service.list_evidence("inv-1")[0].evidence_id == "ev-1"
+    # Same tenant sees evidence
+    assert service.list_evidence("inv-1", tenant_id="org-1")[0].evidence_id == "ev-1"
+    # Different tenant denied
+    try:
+        service.list_evidence("inv-1", tenant_id="org-2")
+        raise AssertionError("Expected TenantIsolationError for cross-tenant evidence access")
+    except TenantIsolationError:
+        pass
+
+
+def test_cross_tenant_api_level_access_denied():
+    """Test that cross-tenant access is blocked at the actual API endpoint level."""
+    from fastapi.testclient import TestClient
+    from safenestt.api.app import app
+    client = TestClient(app, raise_server_exceptions=False)
+    # Tenant A creates investigation
+    create_resp = client.post("/v1/investigations", json={
+        "target": {"type": "domain", "value": "secret.example.com"},
+        "investigation_type": "cybersecurity",
+        "tenant_id": "tenant-a",
+    })
+    assert create_resp.status_code == 200
+    inv_id = create_resp.json()["investigation_id"]
+    # Tenant A can fetch
+    a_resp = client.get(f"/v1/investigations/{inv_id}?tenant_id=tenant-a")
+    assert a_resp.status_code == 200
+    # Tenant B must be denied (403)
+    b_resp = client.get(f"/v1/investigations/{inv_id}?tenant_id=tenant-b")
+    assert b_resp.status_code == 403
+    b_body = b_resp.json()
+    assert b_body["detail"]["code"] == "tenant_access_denied"
+    # Tenant B should NOT see the investigation_id or target
+    assert "investigation_id" not in b_body
 
 
 def test_reality_checker_provenance_rejection():
@@ -1122,10 +1163,10 @@ def test_complete_investigation_lifecycle():
     from fastapi.testclient import TestClient
     from safenestt.api.app import app
     client = TestClient(app)
-    create = client.post("/v1/investigations", json={"target": {"type": "domain", "value": "example.com"}, "investigation_type": "cybersecurity"})
+    create = client.post("/v1/investigations", json={"target": {"type": "domain", "value": "example.com"}, "investigation_type": "cybersecurity", "tenant_id": "org-1"})
     assert create.status_code == 200
     investigation_id = create.json()["investigation_id"]
-    get_resp = client.get(f"/v1/investigations/{investigation_id}")
+    get_resp = client.get(f"/v1/investigations/{investigation_id}?tenant_id=org-1")
     assert get_resp.status_code == 200
 
 

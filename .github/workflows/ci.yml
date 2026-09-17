@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: safenestt_ai
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run tests
+        env:
+          DATABASE_URL: "postgresql://postgres:testpass@localhost:5432/safenestt_ai"
+          POSTGRES_PASSWORD: testpass
+        run: |
+          python -m pytest tests/ -v --tb=short --junitxml=test-results.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results.xml
+
+      - name: Security scan (pip audit)
+        run: |
+          pip install pip-audit
+          pip-audit --strict || true
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: safenestt-ai:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Test container starts
+        run: |
+          docker run --rm -d --name safenestt-test \
+            -e MODE=development \
+            -e OPENROUTER_API_KEY=test \
+            -p 8000:8000 \
+            safenestt-ai:latest
+          sleep 10
+          curl -f http://localhost:8000/v1/health || exit 1
+          docker stop safenestt-test

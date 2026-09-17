@@ -1,5 +1,38 @@
 __pycache__/
 *.pyc
+*.pyo
 .pytest_cache/
 .coverage
+htmlcov/
 .venv/
+env/
+.eggs/
+dist/
+build/
+*.egg-info/
+
+# Env / secrets
+.env
+.env.*
+.env.local
+.env.development
+.env.production
+.env.test
+pat.env
+*.pem
+*.key
+credentials.json
+secrets.yaml
+secrets.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs / temp
+*.log
+tmp/
+temp/
+out/

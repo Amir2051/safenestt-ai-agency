@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "safenestt"
+version = "0.1.0"
+description = "SafeNestT AI investigation engine"
+requires-python = ">=3.11"
+
+dependencies = [
+  "dnspython>=2.6,<3",
+  "fastapi>=0.115,<1",
+  "pydantic>=2.6,<3",
+  "uvicorn>=0.30,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+]
+
+[tool.setuptools.packages.find]
+include = ["safenestt*", "modules*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-p no:cacheprovider"
