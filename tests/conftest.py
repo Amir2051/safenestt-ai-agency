@@ -27,28 +27,40 @@ except Exception as exc:
 
 @pytest.fixture(autouse=True)
 def _clean_test_db():
-    """Clean test data before each test."""
+    """Clean test data before each test.
+    
+    CRITICAL: Uses OWNER engine for schema setup AND truncation because
+    the app role cannot truncate tables it doesn't own.
+    The app engine is only used for actual test operations (via session_scope).
+    """
     from safenestt.persistence.models import Base
     from sqlalchemy import text, inspect as sa_inspect
     
+    # Use owner engine for ALL setup and cleanup operations
     owner_engine = get_owner_engine()
+    
+    # Create schema
     Base.metadata.create_all(owner_engine)
     
+    # Apply RLS policies
     try:
         from safenestt.persistence.rls import apply_rls_policies
         apply_rls_policies(owner_engine)
     except Exception:
         pass
     
-    from safenestt.persistence.engine import get_engine
-    engine = get_engine()
-    if engine:
-        with engine.connect() as conn:
-            inspector = sa_inspect(engine)
-            existing_tables = inspector.get_table_names()
-            for table in reversed(Base.metadata.sorted_tables):
-                if table.name in existing_tables:
-                    conn.execute(text(f"TRUNCATE TABLE {table.name} CASCADE"))
-            conn.commit()
+    # Truncate ALL tables using OWNER engine (app role can't truncate)
+    with owner_engine.connect() as conn:
+        inspector = sa_inspect(owner_engine)
+        existing_tables = inspector.get_table_names()
+        for table in reversed(Base.metadata.sorted_tables):
+            if table.name in existing_tables:
+                # Use owner engine for truncation (bypasses RLS)
+                conn.execute(text(f"TRUNCATE TABLE {table.name} CASCADE"))
+        conn.commit()
     
     yield
+
+
+print("[conftest] safenestt:", safenestt.__file__, file=sys.stderr)
+print("[conftest] permissions:", _permissions_mod.__file__, file=sys.stderr)

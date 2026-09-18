@@ -1,5 +1,7 @@
 from fastapi import FastAPI, HTTPException, Request, Depends
 from pydantic import BaseModel
+import hashlib
+import hmac
 from typing import Any
 import os
 import logging
@@ -15,6 +17,10 @@ from safenestt.model.registry import GeminiProvider, ModelProvider, OllamaProvid
 from safenestt.security.encryption import is_encryption_enabled
 from safenestt.security.rate_limit import RateLimitService, RateLimitScope
 from safenestt.security.api_keys import get_key_store
+from safenestt.local_env import load_local_osint_env
+
+# Local development only: load the user's explicitly designated OSINT env files.
+load_local_osint_env()
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +139,14 @@ def get_api_context(request: Request) -> tuple[str, str]:
     is_valid, tenant_id, key_fingerprint, metadata = store.validate_key(api_key)
     
     if is_valid:
+        asserted_tenant = request.headers.get("X-SafeNestT-Tenant")
+        assertion = request.headers.get("X-SafeNestT-Tenant-Signature")
+        client_secret = os.getenv("SAFENESTT_CLIENT_SERVICE_SECRET")
+        if asserted_tenant and assertion and client_secret:
+            expected = hmac.new(client_secret.encode(), asserted_tenant.encode(), hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(expected, assertion):
+                raise _to_api_error("tenant_assertion_invalid", "Invalid tenant assertion", 403)
+            tenant_id = asserted_tenant
         return tenant_id, key_fingerprint
     
     error = metadata.get("error", "invalid_key")

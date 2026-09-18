@@ -76,6 +76,34 @@ def _parse_model_json(response: ModelResponse) -> dict[str, Any]:
     return {"plan": ["dns.lookup.lookup"], "findings": [{"claim": content[:240]}], "finished": True}
 
 
+def _case_context(target: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    try:
+        parsed = __import__("json").loads(target)
+        if not isinstance(parsed, dict):
+            raise ValueError
+    except Exception:
+        return target, {"domain": target}, {}
+    indicators: dict[str, Any] = {}
+    intake = parsed.get("intake") or {}
+    complainant_email = intake.get("complainant_email")
+    complainant_phone = intake.get("complainant_phone")
+    if complainant_email: indicators["email"] = complainant_email
+    if complainant_phone: indicators["phone"] = complainant_phone
+    for subject in intake.get("subjects") or []:
+        for key, indicator_key in (("email", "email"), ("phone", "phone"), ("ip_address", "ip_address"), ("website_social_media", "domain")):
+            value = subject.get(key) if isinstance(subject, dict) else None
+            if value and indicator_key not in indicators:
+                indicators[indicator_key] = value
+    for transaction in intake.get("transactions") or []:
+        if not isinstance(transaction, dict):
+            continue
+        if transaction.get("recipient_wallet_address") and "wallet_address" not in indicators:
+            indicators["wallet_address"] = transaction["recipient_wallet_address"]
+        if transaction.get("transaction_id_hash") and "transaction_hash" not in indicators:
+            indicators["transaction_hash"] = transaction["transaction_id_hash"]
+    return str(parsed.get("description") or target), indicators, parsed
+
+
 def run_investigation(*, investigation_id: str, target: str, tenant_id: str | None = None, created_by: str | None = None, model_provider: ModelProvider | None = None, store: PersistentInvestigationStore | None = None, dry_run: bool = False, api_key_hash: str | None = None) -> dict[str, Any]:
     if store is None:
         store = PersistentInvestigationStore(api_key_hash=api_key_hash)
@@ -137,14 +165,16 @@ def run_investigation(*, investigation_id: str, target: str, tenant_id: str | No
         status="running",
     )
 
+    human_target, indicators, case_context = _case_context(record.target or target)
     orchestrator = InvestigationOrchestrator(permission_manager=PermissionManager())
     orchestrator_inputs: dict[str, Any] = {
-        "target": target,
+        "target": human_target,
         "investigation_id": investigation_id,
         "case_id": investigation_id,
         "created_by": created_by,
         "tenant_id": tenant_id,
-        "indicators": {"domain": target},
+        "indicators": indicators,
+        "case_context": case_context,
     }
 
     try:
@@ -171,6 +201,22 @@ def run_investigation(*, investigation_id: str, target: str, tenant_id: str | No
             "error": record.error,
         }
 
+    model_response = provider.generate(ModelRequest(
+        prompt=("You are the senior SafeNestT fraud investigator. Review the multi-agent findings below. "
+                "Do not invent facts. Return a concise investigation synthesis and next steps.\n" +
+                __import__("json").dumps(orch_result.get("findings", []), default=str)[:12000]),
+        model=getattr(provider, "default_model", None),
+        temperature=0.1,
+        max_tokens=1200,
+        response_format="json_object",
+    ))
+    if model_response.error:
+        record.error = {"code": "model_synthesis_failed", "message": model_response.error.message}
+        record.mark("FAILED")
+        store.update_investigation(record)
+        return {"investigation_id": investigation_id, "status": "FAILED", "target": target, "tenant_id": tenant_id, "created_by": created_by, "tool_calls": 0, "evidence": [], "findings": [], "risk": calculate_risk([]), "model_provider": getattr(provider, "provider_name", None), "model": getattr(provider, "default_model", None), "error": record.error}
+
+    model_claim = (model_response.content or "").strip()
     # ---- Transform orchestrator output to API format ----
     evidence_items: list[EvidenceRecord] = []
     findings: list[FindingRecord] = []
@@ -217,6 +263,19 @@ def run_investigation(*, investigation_id: str, target: str, tenant_id: str | No
         store.add_evidence(ev)
     for finding in findings:
         store.add_finding(finding)
+
+    if model_claim:
+        model_finding = FindingRecord(
+            investigation_id=investigation_id,
+            finding_id=_stable_id(),
+            claim=model_claim[:4000],
+            evidence_ids=[item.evidence_id for item in evidence_items],
+            reality_status="AI_INFERENCE",
+            risk_score=0.5,
+            factors={"model": getattr(provider, "default_model", None), "provider": getattr(provider, "provider_name", None)},
+        )
+        store.add_finding(model_finding)
+        findings.append(model_finding)
 
     if not findings:
         fallback = FindingRecord(investigation_id=investigation_id, finding_id=_stable_id(), claim="No findings produced by orchestrator", evidence_ids=[item.evidence_id for item in evidence_items])

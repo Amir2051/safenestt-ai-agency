@@ -1,9 +1,15 @@
 """Production API store backed by PostgreSQL with RLS, encryption, and audit.
 
 CRITICAL: This store uses session-bound tenant context for RLS.
-Instead of passing tenant_id directly to session_scope (which could be spoofed),
-we pass the API key hash. The SECURITY DEFINER function establish_tenant_context()
-validates the key hash and records (pg_backend_pid(), tenant_id) server-side.
+The API layer passes (tenant_id, key_fingerprint) to the store,
+which forwards them to session_scope().
+
+ENCRYPTED FIELDS:
+- InvestigationModel.target → encrypted
+- EvidenceModel.target, .data → encrypted
+- FindingModel.claim, .factors → encrypted
+- AgentRunModel.inputs, .outputs → encrypted
+- ReportModel.draft → encrypted
 """
 from __future__ import annotations
 
@@ -22,34 +28,28 @@ from safenestt.persistence.models import (
     ReportModel,
     Base,
 )
-from safenestt.security.encryption import encrypt_value
+from safenestt.security.encryption import encrypt_value, decrypt_value
 from safenestt.security.audit import audit, AuditEvent
 
 
 class TenantIsolationError(PermissionError):
-    """Raised when a cross-tenant access attempt is detected."""
     pass
 
 
 class PersistentInvestigationStore:
-    """PostgreSQL-backed store with RLS, encryption, and audit logging.
+    """PostgreSQL-backed store with RLS, encryption, and audit logging."""
     
-    Uses session-bound tenant context: the API key hash is passed to
-    session_scope(), which calls establish_tenant_context() to validate
-    and record the tenant context server-side.
-    """
-    
-    def __init__(self, api_key_hash: str | None = None, tenant_id: str | None = None):
-        self._api_key_hash = api_key_hash
-        self._tenant_id = tenant_id  # Only used for bypass operations
+    def __init__(self, tenant_id: str | None = None, key_fingerprint: str | None = None):
+        self._tenant_id = tenant_id
+        self._key_fingerprint = key_fingerprint
     
     def _session(self):
         """Get a session scope with tenant context established."""
-        return session_scope(self._api_key_hash)
+        return session_scope(self._tenant_id, self._key_fingerprint)
     
     def create_investigation(self, record: InvestigationRecord) -> InvestigationRecord:
-        if not self._api_key_hash:
-            raise TenantIsolationError("API key required for database access")
+        if not self._tenant_id or not self._key_fingerprint:
+            raise TenantIsolationError("Tenant context required for database access")
         
         with self._session() as session:
             model = InvestigationModel(
@@ -65,7 +65,6 @@ class PersistentInvestigationStore:
             session.add(model)
             session.flush()
             
-            # Audit the creation
             audit_event = AuditEvent(
                 event_id=f"inv-create-{record.investigation_id}",
                 actor_type="api",
@@ -78,8 +77,8 @@ class PersistentInvestigationStore:
             return record
     
     def get_investigation(self, investigation_id: str) -> InvestigationRecord | None:
-        if not self._api_key_hash:
-            raise TenantIsolationError("API key required for database access")
+        if not self._tenant_id or not self._key_fingerprint:
+            raise TenantIsolationError("Tenant context required for database access")
         
         with self._session() as session:
             from sqlalchemy import select
@@ -96,7 +95,7 @@ class PersistentInvestigationStore:
                 investigation_id=result.investigation_id,
                 tenant_id=result.tenant_id,
                 created_by=result.created_by,
-                target=result.target,
+                target=decrypt_value(result.target),
                 type=result.type,
                 status=result.status,
                 created_at=result.created_at,
@@ -104,8 +103,8 @@ class PersistentInvestigationStore:
             )
     
     def update_investigation(self, record: InvestigationRecord) -> InvestigationRecord:
-        if not self._api_key_hash:
-            raise TenantIsolationError("API key required for database access")
+        if not self._tenant_id or not self._key_fingerprint:
+            raise TenantIsolationError("Tenant context required for database access")
         
         with self._session() as session:
             from sqlalchemy import select
@@ -129,8 +128,8 @@ class PersistentInvestigationStore:
             return record
     
     def add_evidence(self, evidence: EvidenceRecord) -> EvidenceRecord:
-        if not self._api_key_hash:
-            raise TenantIsolationError("API key required for database access")
+        if not self._tenant_id or not self._key_fingerprint:
+            raise TenantIsolationError("Tenant context required for database access")
         
         with self._session() as session:
             model = EvidenceModel(
@@ -138,9 +137,9 @@ class PersistentInvestigationStore:
                 investigation_id=evidence.investigation_id,
                 source=evidence.source,
                 source_type=evidence.source_type,
-                target=evidence.target,
+                target=encrypt_value(evidence.target),
                 observed_at=evidence.observed_at,
-                data=evidence.data,
+                data=encrypt_value(evidence.data),
                 confidence=evidence.confidence,
                 tool_run_id=evidence.tool_run_id,
             )
@@ -150,8 +149,8 @@ class PersistentInvestigationStore:
             return evidence
     
     def list_evidence(self, investigation_id: str) -> list[EvidenceRecord]:
-        if not self._api_key_hash:
-            raise TenantIsolationError("API key required for database access")
+        if not self._tenant_id or not self._key_fingerprint:
+            raise TenantIsolationError("Tenant context required for database access")
         
         with self._session() as session:
             from sqlalchemy import select
@@ -167,9 +166,9 @@ class PersistentInvestigationStore:
                     evidence_id=r.evidence_id,
                     source=r.source,
                     source_type=r.source_type,
-                    target=r.target,
+                    target=decrypt_value(r.target),
                     observed_at=r.observed_at,
-                    data=r.data or {},
+                    data=decrypt_value(r.data) or {},
                     confidence=r.confidence or 0.0,
                     tool_run_id=r.tool_run_id,
                 )
@@ -177,18 +176,18 @@ class PersistentInvestigationStore:
             ]
     
     def add_finding(self, finding: FindingRecord) -> FindingRecord:
-        if not self._api_key_hash:
-            raise TenantIsolationError("API key required for database access")
+        if not self._tenant_id or not self._key_fingerprint:
+            raise TenantIsolationError("Tenant context required for database access")
         
         with self._session() as session:
             model = FindingModel(
                 finding_id=finding.finding_id,
                 investigation_id=finding.investigation_id,
-                claim=finding.claim,
+                claim=encrypt_value(finding.claim),
                 evidence_ids=finding.evidence_ids,
                 reality_status=finding.reality_status,
                 risk_score=finding.risk_score,
-                factors=finding.factors,
+                factors=encrypt_value(finding.factors),
             )
             session.add(model)
             session.flush()
@@ -196,8 +195,8 @@ class PersistentInvestigationStore:
             return finding
     
     def list_findings(self, investigation_id: str) -> list[FindingRecord]:
-        if not self._api_key_hash:
-            raise TenantIsolationError("API key required for database access")
+        if not self._tenant_id or not self._key_fingerprint:
+            raise TenantIsolationError("Tenant context required for database access")
         
         with self._session() as session:
             from sqlalchemy import select
@@ -211,18 +210,18 @@ class PersistentInvestigationStore:
                 FindingRecord(
                     investigation_id=r.investigation_id,
                     finding_id=r.finding_id,
-                    claim=r.claim,
+                    claim=decrypt_value(r.claim),
                     evidence_ids=r.evidence_ids or [],
                     reality_status=r.reality_status or "AI_INFERENCE",
                     risk_score=r.risk_score or 0.0,
-                    factors=r.factors or {},
+                    factors=decrypt_value(r.factors) or {},
                 )
                 for r in results
             ]
     
     def list_investigations(self) -> list[InvestigationRecord]:
-        if not self._api_key_hash:
-            raise TenantIsolationError("API key required for database access")
+        if not self._tenant_id or not self._key_fingerprint:
+            raise TenantIsolationError("Tenant context required for database access")
         
         with self._session() as session:
             from sqlalchemy import select
@@ -235,7 +234,7 @@ class PersistentInvestigationStore:
                     investigation_id=r.investigation_id,
                     tenant_id=r.tenant_id,
                     created_by=r.created_by,
-                    target=r.target,
+                    target=decrypt_value(r.target),
                     type=r.type,
                     status=r.status,
                     created_at=r.created_at,
@@ -246,11 +245,7 @@ class PersistentInvestigationStore:
 
 
 def ensure_schema() -> None:
-    """Create all tables if they don't exist using the app engine.
-    
-    NOTE: In production, schema is created by the `migrate` job which runs
-    as the owner role. This function is for development/testing only.
-    """
+    """Create all tables if they don't exist using the app engine."""
     engine = create_engine()
     Base.metadata.create_all(engine)
     
