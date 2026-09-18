@@ -31,6 +31,8 @@ from safenestt.persistence.models import (
 from safenestt.security.encryption import encrypt_value, decrypt_value
 from safenestt.security.audit import AuditEvent
 from safenestt.persistence.store import PersistentAuditLogger
+from safenestt.persistence.repositories import AuditEventRepository
+from safenestt.registry import RiskLevel
 
 
 class TenantIsolationError(PermissionError):
@@ -66,19 +68,20 @@ class PersistentInvestigationStore:
             session.add(model)
             session.flush()
             
-            persistent_audit = PersistentAuditLogger()
-            audit_event = AuditEvent(
+            # Audit using the same session (tenant context already established)
+            audit = AuditEventRepository(session)
+            audit.record(AuditEvent(
                 event_id=f"inv-create-{record.investigation_id}",
                 actor_type="api",
                 actor_id=record.created_by,
                 action="investigation.create",
                 decision="ALLOW",
+                risk_level=RiskLevel.LOW,
                 resource_type="investigation",
                 resource_id=record.investigation_id,
                 detail=f"Created investigation for {record.target}",
                 metadata={"investigation_id": record.investigation_id},
-            )
-            persistent_audit.record(audit_event)
+            ))
             
             return record
     

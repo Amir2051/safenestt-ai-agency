@@ -343,9 +343,6 @@ def get_investigation_report(
 
 _approval_service = ApprovalService(PersistentApprovalRepository())
 
-# Type alias for the PostgreSQL approval repository to avoid confusion with the abstract one
-PostgresApprovalRepository = ApprovalRepository
-
 
 @app.get("/v1/approvals", response_model=list[dict])
 def list_pending_approvals(

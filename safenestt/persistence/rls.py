@@ -77,18 +77,37 @@ ALTER TABLE audit_events FORCE ROW LEVEL SECURITY;
 
 -- Drop existing policies
 DROP POLICY IF EXISTS investigations_tenant_isolation ON investigations;
+DROP POLICY IF EXISTS investigations_insert ON investigations;
 DROP POLICY IF EXISTS agent_runs_tenant_isolation ON agent_runs;
+DROP POLICY IF EXISTS agent_runs_insert ON agent_runs;
 DROP POLICY IF EXISTS findings_tenant_isolation ON findings;
+DROP POLICY IF EXISTS findings_insert ON findings;
 DROP POLICY IF EXISTS evidence_tenant_isolation ON evidence;
+DROP POLICY IF EXISTS evidence_insert ON evidence;
 DROP POLICY IF EXISTS reports_tenant_isolation ON reports;
+DROP POLICY IF EXISTS reports_insert ON reports;
 DROP POLICY IF EXISTS audit_events_tenant_isolation ON audit_events;
+DROP POLICY IF EXISTS audit_events_insert ON audit_events;
+DROP POLICY IF EXISTS audit_events_update ON audit_events;
+DROP POLICY IF EXISTS audit_events_delete ON audit_events;
+DROP POLICY IF EXISTS audit_events_policy ON audit_events;
+DROP POLICY IF EXISTS audit_events_insert ON audit_events;
 
 -- Policies use get_current_tenant()
 CREATE POLICY investigations_tenant_isolation ON investigations
     USING (tenant_id = get_current_tenant());
 
+CREATE POLICY investigations_insert ON investigations
+    FOR INSERT WITH CHECK (tenant_id = get_current_tenant());
+
 CREATE POLICY agent_runs_tenant_isolation ON agent_runs
     USING (investigation_id IN (
+        SELECT investigation_id FROM investigations
+        WHERE tenant_id = get_current_tenant()
+    ));
+
+CREATE POLICY agent_runs_insert ON agent_runs
+    FOR INSERT WITH CHECK (investigation_id IN (
         SELECT investigation_id FROM investigations
         WHERE tenant_id = get_current_tenant()
     ));
@@ -99,8 +118,20 @@ CREATE POLICY findings_tenant_isolation ON findings
         WHERE tenant_id = get_current_tenant()
     ));
 
+CREATE POLICY findings_insert ON findings
+    FOR INSERT WITH CHECK (investigation_id IN (
+        SELECT investigation_id FROM investigations
+        WHERE tenant_id = get_current_tenant()
+    ));
+
 CREATE POLICY evidence_tenant_isolation ON evidence
     USING (investigation_id IN (
+        SELECT investigation_id FROM investigations
+        WHERE tenant_id = get_current_tenant()
+    ));
+
+CREATE POLICY evidence_insert ON evidence
+    FOR INSERT WITH CHECK (investigation_id IN (
         SELECT investigation_id FROM investigations
         WHERE tenant_id = get_current_tenant()
     ));
@@ -111,11 +142,18 @@ CREATE POLICY reports_tenant_isolation ON reports
         WHERE tenant_id = get_current_tenant()
     ));
 
-CREATE POLICY audit_events_tenant_isolation ON audit_events
-    USING (investigation_id IS NULL OR investigation_id IN (
+CREATE POLICY reports_insert ON reports
+    FOR INSERT WITH CHECK (investigation_id IN (
         SELECT investigation_id FROM investigations
         WHERE tenant_id = get_current_tenant()
     ));
+
+CREATE POLICY audit_events_policy ON audit_events FOR ALL
+    USING (investigation_id IS NULL OR investigation_id IN (
+        SELECT investigation_id FROM investigations
+        WHERE tenant_id = get_current_tenant()
+    ))
+    WITH CHECK (true);
 """
 
 

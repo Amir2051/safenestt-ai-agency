@@ -46,7 +46,7 @@ def _test_data():
 
 def test_target_encrypted_at_rest(_test_data):
     """Investigation target must be encrypted in the database."""
-    store = PersistentInvestigationStore(api_key_hash=_test_data["fingerprint"])
+    store = PersistentInvestigationStore(tenant_id=_test_data["tenant"], key_fingerprint=_test_data["fingerprint"])
     
     # Create an investigation with sensitive target
     from safenestt.investigations.records import InvestigationRecord
@@ -77,7 +77,7 @@ def test_target_encrypted_at_rest(_test_data):
 
 def test_target_decrypted_at_boundary(_test_data):
     """Investigation target must be decrypted when read through the API."""
-    store = PersistentInvestigationStore(api_key_hash=_test_data["fingerprint"])
+    store = PersistentInvestigationStore(tenant_id=_test_data["tenant"], key_fingerprint=_test_data["fingerprint"])
     
     plaintext = "secret-target-at-boundary.com"
     from safenestt.investigations.records import InvestigationRecord
@@ -100,7 +100,7 @@ def test_target_decrypted_at_boundary(_test_data):
 
 def test_evidence_target_encrypted(_test_data):
     """Evidence target must be encrypted at rest."""
-    store = PersistentInvestigationStore(api_key_hash=_test_data["fingerprint"])
+    store = PersistentInvestigationStore(tenant_id=_test_data["tenant"], key_fingerprint=_test_data["fingerprint"])
     
     # Create parent investigation first
     from safenestt.investigations.records import InvestigationRecord
@@ -147,7 +147,7 @@ def test_evidence_target_encrypted(_test_data):
 
 def test_finding_claim_encrypted(_test_data):
     """Finding claim must be encrypted at rest."""
-    store = PersistentInvestigationStore(api_key_hash=_test_data["fingerprint"])
+    store = PersistentInvestigationStore(tenant_id=_test_data["tenant"], key_fingerprint=_test_data["fingerprint"])
     
     # Create parent investigation
     from safenestt.investigations.records import InvestigationRecord
@@ -194,7 +194,7 @@ def test_finding_claim_encrypted(_test_data):
 
 def test_cross_tenant_access_returns_ciphertext(_test_data):
     """Even if a cross-tenant read bypasses RLS, the data is useless ciphertext."""
-    store1 = PersistentInvestigationStore(api_key_hash=_test_data["fingerprint"])
+    store1 = PersistentInvestigationStore(tenant_id=_test_data["tenant"], key_fingerprint=_test_data["fingerprint"])
     
     # Create investigation
     from safenestt.investigations.records import InvestigationRecord
@@ -214,7 +214,7 @@ def test_cross_tenant_access_returns_ciphertext(_test_data):
     fp_2 = _compute_key_fingerprint(raw_key_2)
     
     # Try to read with different tenant's key
-    store2 = PersistentInvestigationStore(api_key_hash=fp_2)
+    store2 = PersistentInvestigationStore(tenant_id="tenant-other", key_fingerprint=fp_2)
     result = store2.get_investigation(f"inv-crosstenant-{_test_data['test_id']}")
     
     # RLS should block the read entirely
@@ -223,22 +223,38 @@ def test_cross_tenant_access_returns_ciphertext(_test_data):
 
 def test_encryption_round_trip():
     """Verify encrypt/decrypt round trip for all sensitive data types."""
-    # String
-    plaintext_str = "sensitive string data"
-    encrypted_str = encrypt_value(plaintext_str)
-    assert encrypted_str != plaintext_str
-    assert decrypt_value(encrypted_str) == plaintext_str
+    import os
+    from cryptography.fernet import Fernet
+    from safenestt.security.secrets import clear_cache
     
-    # Dict
-    plaintext_dict = {"key1": "value1", "nested": {"key2": "value2"}}
-    encrypted_dict = encrypt_value(plaintext_dict)
-    assert encrypted_dict != plaintext_dict
-    decrypted_dict = decrypt_value(encrypted_dict)
-    assert decrypted_dict == plaintext_dict
+    # Set a valid encryption key for this test
+    original_key = os.environ.get("SAFENESTT_ENCRYPTION_KEY")
+    valid_key = Fernet.generate_key().decode()
+    os.environ["SAFENESTT_ENCRYPTION_KEY"] = valid_key
+    clear_cache()
     
-    # None
-    assert encrypt_value(None) is None
-    assert decrypt_value(None) is None
+    try:
+        # String
+        plaintext_str = "sensitive string data"
+        encrypted_str = encrypt_value(plaintext_str)
+        assert encrypted_str != plaintext_str
+        assert decrypt_value(encrypted_str) == plaintext_str
+        
+        # Dict
+        plaintext_dict = {"key1": "value1", "nested": {"key2": "value2"}}
+        encrypted_dict = encrypt_value(plaintext_dict)
+        assert encrypted_dict != str(plaintext_dict)
+        assert decrypt_value(encrypted_dict) == plaintext_dict
+        
+        # None handling
+        assert encrypt_value(None) is None
+        assert decrypt_value(None) is None
+    finally:
+        if original_key is None:
+            os.environ.pop("SAFENESTT_ENCRYPTION_KEY", None)
+        else:
+            os.environ["SAFENESTT_ENCRYPTION_KEY"] = original_key
+        clear_cache()
 
 
 def test_encryption_enabled_check():
