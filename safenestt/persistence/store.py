@@ -60,15 +60,29 @@ class PersistentStore:
 
 
 class PersistentAuditLogger:
+    """Lazy-initialized persistent audit logger.
+
+    Store is created on first use, not at construction time, to avoid
+    import-time dependencies on engine initialization.
+    """
+
     def __init__(self, store: PersistentStore | None = None) -> None:
-        self.store = store or PersistentStore()
+        self._store = store
+        self._initialized = store is not None
+
+    def _ensure_store(self) -> PersistentStore:
+        if not self._initialized:
+            self._store = PersistentStore()
+            self._initialized = True
+        assert self._store is not None
+        return self._store
 
     def record(self, event: Any) -> Any:
-        self.store.audit.record(event)
+        self._ensure_store().audit.record(event)
         return event
 
     def recent(self, limit: int = 100) -> list[Any]:
-        with self.store._session() as s:
+        with self._ensure_store()._session() as s:
             return list(
                 s.execute(
                     text("SELECT * FROM audit_events ORDER BY created_at DESC LIMIT :limit").bindparams(limit=limit)
@@ -77,11 +91,25 @@ class PersistentAuditLogger:
 
 
 class PersistentApprovalRepository:
+    """Lazy-initialized persistent approval repository.
+
+    Store is created on first use, not at construction time, to avoid
+    import-time dependencies on engine initialization.
+    """
+
     def __init__(self, store: PersistentStore | None = None) -> None:
-        self.store = store or PersistentStore()
+        self._store = store
+        self._initialized = store is not None
+
+    def _ensure_store(self) -> PersistentStore:
+        if not self._initialized:
+            self._store = PersistentStore()
+            self._initialized = True
+        assert self._store is not None
+        return self._store
 
     def create(self, record: Any) -> Any:
-        self.store.audit.record(
+        self._ensure_store().audit.record(
             type("AuditEvent", (), {
                 "event_id": f"approval-{record.approval_id}",
                 "investigation_id": None,

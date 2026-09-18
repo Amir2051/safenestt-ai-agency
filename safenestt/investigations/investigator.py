@@ -11,10 +11,7 @@ from safenestt.investigations.reality import RealityChecker
 from safenestt.model.provider import ModelProvider, ModelRequest, ModelResponse
 from safenestt.registry import AgentRecord, AgentRegistry, AgentStatus, RiskLevel
 from safenestt.security.approval import ApprovalService
-from safenestt.security.audit import AuditEvent, AuditLogger
-from safenestt.security.pipeline import SecurityPipeline
 from safenestt.security.permissions import PermissionManager
-from safenestt.security.rate_limit import RateLimitService
 from safenestt.security.redaction import redact
 from safenestt.tools.dns import DNSAdapter
 from safenestt.tools.interface import ToolInterface
@@ -104,11 +101,10 @@ def _case_context(target: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
     return str(parsed.get("description") or target), indicators, parsed
 
 
-def run_investigation(*, investigation_id: str, target: str, tenant_id: str | None = None, created_by: str | None = None, model_provider: ModelProvider | None = None, store: PersistentInvestigationStore | None = None, dry_run: bool = False, api_key_hash: str | None = None) -> dict[str, Any]:
+def run_investigation(*, investigation_id: str, target: str, tenant_id: str | None = None, created_by: str | None = None, model_provider: ModelProvider | None = None, store: PersistentInvestigationStore | None = None, dry_run: bool = False, api_key_hash: str | None = None, key_fingerprint: str | None = None) -> dict[str, Any]:
     if store is None:
-        store = PersistentInvestigationStore(api_key_hash=api_key_hash)
+        store = PersistentInvestigationStore(tenant_id=tenant_id, key_fingerprint=key_fingerprint)
     permission_manager = PermissionManager()
-    pipeline = SecurityPipeline(permission_manager=permission_manager, approval_service=ApprovalService(), rate_limit_service=RateLimitService(), audit_logger=AuditLogger())
     tool_interface = ToolInterface(permission_manager=permission_manager)
     checker = RealityChecker(evidence_lookup=lambda investigation_id, evidence_id: next((e for e in store.list_evidence(investigation_id) if e.evidence_id == evidence_id), None))
     agent = AgentRecord(agent_id="investigator", name="Investigator", enabled=True, status=AgentStatus.ACTIVE, capabilities=["tools.dns.lookup.lookup"], risk_level=RiskLevel.LOW)

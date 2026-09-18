@@ -16,7 +16,9 @@ from safenestt.investigations.store import (
 from safenestt.model.registry import GeminiProvider, ModelProvider, OllamaProvider, OpenAICompatibleProvider
 from safenestt.security.encryption import is_encryption_enabled
 from safenestt.security.rate_limit import RateLimitService, RateLimitScope
+from safenestt.security.approval import ApprovalService
 from safenestt.security.api_keys import get_key_store
+from safenestt.persistence.repositories import PersistentApprovalRepository
 from safenestt.local_env import load_local_osint_env
 
 # Local development only: load the user's explicitly designated OSINT env files.
@@ -126,18 +128,19 @@ def _enforce_rate_limit(request: Request, api_key_hash: str) -> None:
 
 def get_api_context(request: Request) -> tuple[str, str]:
     """Authenticate and authorize API request.
-    
-    Returns: (api_key_hash, tenant_id)
-    
-    All keys must be registered in PostgreSQL. No fallback to raw-key-as-tenant.
+
+    Returns: (tenant_id, key_fingerprint)
+
+    key_fingerprint is SHA-256 of the raw API key — used for RLS session
+    context and per-key rate limiting.
     """
     api_key = request.headers.get("X-API-Key")
     if not api_key:
         raise _to_api_error("missing_api_key", "X-API-Key header is required", 401)
-    
+
     store = get_key_store()
     is_valid, tenant_id, key_fingerprint, metadata = store.validate_key(api_key)
-    
+
     if is_valid:
         asserted_tenant = request.headers.get("X-SafeNestT-Tenant")
         assertion = request.headers.get("X-SafeNestT-Tenant-Signature")
@@ -148,7 +151,7 @@ def get_api_context(request: Request) -> tuple[str, str]:
                 raise _to_api_error("tenant_assertion_invalid", "Invalid tenant assertion", 403)
             tenant_id = asserted_tenant
         return tenant_id, key_fingerprint
-    
+
     error = metadata.get("error", "invalid_key")
     if error == "key_revoked":
         raise _to_api_error("key_revoked", "This API key has been revoked", 401)
@@ -209,10 +212,10 @@ def create_investigation(
     request: Request,
     api_context: tuple = Depends(get_api_context),
 ) -> dict[str, Any]:
-    api_key_hash, tenant_id = api_context
-    _enforce_rate_limit(request, api_key_hash)
+    tenant_id, key_fingerprint = api_context
+    _enforce_rate_limit(request, key_fingerprint)
     
-    service = PersistentInvestigationStore(api_key_hash=api_key_hash)
+    service = PersistentInvestigationStore(tenant_id=tenant_id, key_fingerprint=key_fingerprint)
     record = InvestigationRecord(
         investigation_id=__import__("uuid").uuid4().hex,
         tenant_id=tenant_id,
@@ -233,10 +236,10 @@ def start_investigation(
     request: Request,
     api_context: tuple = Depends(get_api_context),
 ) -> dict[str, Any]:
-    api_key_hash, tenant_id = api_context
-    _enforce_rate_limit(request, api_key_hash)
+    tenant_id, key_fingerprint = api_context
+    _enforce_rate_limit(request, key_fingerprint)
     
-    service = PersistentInvestigationStore(api_key_hash=api_key_hash)
+    service = PersistentInvestigationStore(tenant_id=tenant_id, key_fingerprint=key_fingerprint)
     try:
         record = service.get_investigation(investigation_id)
     except TenantIsolationError as exc:
@@ -269,8 +272,8 @@ def get_investigation(
     investigation_id: str,
     api_context: tuple = Depends(get_api_context),
 ) -> dict[str, Any]:
-    api_key_hash, tenant_id = api_context
-    service = PersistentInvestigationStore(api_key_hash=api_key_hash)
+    tenant_id, key_fingerprint = api_context
+    service = PersistentInvestigationStore(tenant_id=tenant_id, key_fingerprint=key_fingerprint)
     try:
         record = service.get_investigation(investigation_id)
     except TenantIsolationError as exc:
@@ -285,8 +288,8 @@ def get_investigation_evidence(
     investigation_id: str,
     api_context: tuple = Depends(get_api_context),
 ) -> list[dict[str, Any]]:
-    api_key_hash, tenant_id = api_context
-    service = PersistentInvestigationStore(api_key_hash=api_key_hash)
+    tenant_id, key_fingerprint = api_context
+    service = PersistentInvestigationStore(tenant_id=tenant_id, key_fingerprint=key_fingerprint)
     try:
         evidence = service.list_evidence(investigation_id)
     except TenantIsolationError as exc:
@@ -299,8 +302,8 @@ def get_investigation_findings(
     investigation_id: str,
     api_context: tuple = Depends(get_api_context),
 ) -> list[dict[str, Any]]:
-    api_key_hash, tenant_id = api_context
-    service = PersistentInvestigationStore(api_key_hash=api_key_hash)
+    tenant_id, key_fingerprint = api_context
+    service = PersistentInvestigationStore(tenant_id=tenant_id, key_fingerprint=key_fingerprint)
     try:
         findings = service.list_findings(investigation_id)
     except TenantIsolationError as exc:
@@ -313,8 +316,8 @@ def get_investigation_report(
     investigation_id: str,
     api_context: tuple = Depends(get_api_context),
 ) -> dict[str, Any]:
-    api_key_hash, tenant_id = api_context
-    service = PersistentInvestigationStore(api_key_hash=api_key_hash)
+    tenant_id, key_fingerprint = api_context
+    service = PersistentInvestigationStore(tenant_id=tenant_id, key_fingerprint=key_fingerprint)
     try:
         record = service.get_investigation(investigation_id)
     except TenantIsolationError as exc:
@@ -331,4 +334,70 @@ def get_investigation_report(
         "finding_count": len(findings),
         "findings": [_record_to_dict(finding) for finding in findings],
         "evidence": [_record_to_dict(item) for item in evidence],
+    }
+
+
+# =============================================================================
+# Approval Workflow Endpoints
+# =============================================================================
+
+_approval_service = ApprovalService(PersistentApprovalRepository())
+
+# Type alias for the PostgreSQL approval repository to avoid confusion with the abstract one
+PostgresApprovalRepository = ApprovalRepository
+
+
+@app.get("/v1/approvals", response_model=list[dict])
+def list_pending_approvals(
+    request: Request,
+    api_context: tuple = Depends(get_api_context),
+) -> list[dict[str, Any]]:
+    """List pending approvals for the authenticated tenant."""
+    tenant_id, _ = api_context
+    pending = _approval_service.repository.list_pending(tenant_id=tenant_id)
+    return [
+        {
+            "approval_id": p.approval_id,
+            "agent_id": p.agent_id,
+            "tool_id": p.tool_id,
+            "action": p.action,
+            "requested_capability": p.requested_capability,
+            "risk_level": p.risk_level,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+            "expiration_at": p.expiration_at.isoformat() if p.expiration_at else None,
+            "organization_id": p.organization_id,
+        }
+        for p in pending
+    ]
+
+
+@app.post("/v1/approvals/{approval_id}/decision", response_model=dict)
+def record_approval_decision(
+    approval_id: str,
+    body: dict,
+    request: Request,
+    api_context: tuple = Depends(get_api_context),
+) -> dict[str, Any]:
+    """Record an approve/deny decision for a pending approval.
+    
+    Body: {"approved": true/false, "approver_identity": "optional"}
+    """
+    tenant_id, _ = api_context
+    approved = body.get("approved", False)
+    approver_identity = body.get("approver_identity")
+    
+    record = _approval_service.record_decision(
+        approval_id,
+        approved,
+        tenant_id=tenant_id,
+        approver_identity=approver_identity,
+    )
+    
+    if not record:
+        raise _to_api_error("approval_not_found", "Approval not found or already decided", 404)
+    
+    return {
+        "approval_id": record.approval_id,
+        "status": record.status,
+        "decided": True,
     }

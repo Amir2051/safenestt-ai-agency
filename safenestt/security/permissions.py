@@ -4,7 +4,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from safenestt.registry import AgentRecord, AgentStatus, RiskLevel
-from safenestt.security.audit import AuditEvent, AuditLogger, audit
+from safenestt.security.audit import AuditEvent
+from safenestt.persistence.store import PersistentAuditLogger
 from safenestt.security.redaction import redact
 
 
@@ -25,7 +26,7 @@ class AuthorizationDecision:
 class PermissionManager:
     granted_permissions: dict[str, set[str]] = field(default_factory=dict)
     allowed_permissions: set[str] = field(default_factory=set)
-    audit_logger: AuditLogger = field(default_factory=AuditLogger)
+    audit_logger: Any = field(default_factory=PersistentAuditLogger)
     approval_store: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def grant(self, subject_id: str, permissions: list[str]) -> None:

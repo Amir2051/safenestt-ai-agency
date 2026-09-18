@@ -6,7 +6,8 @@ from typing import Any
 
 from safenestt.registry import AgentRecord, RiskLevel
 from safenestt.security.approval import ApprovalService, InMemoryApprovalRepository
-from safenestt.security.audit import AuditEvent, AuditLogger
+from safenestt.security.audit import AuditEvent
+from safenestt.persistence.store import PersistentAuditLogger
 from safenestt.security.permissions import AuthorizationDecision, PermissionManager
 from safenestt.security.rate_limit import RateLimitService
 
@@ -26,12 +27,12 @@ class SecurityPipeline:
         permission_manager: PermissionManager | None = None,
         approval_service: ApprovalService | None = None,
         rate_limit_service: RateLimitService | None = None,
-        audit_logger: AuditLogger | None = None,
+        audit_logger: Any | None = None,
     ) -> None:
         self.permission_manager = permission_manager or PermissionManager()
         self.approval_service = approval_service or ApprovalService(InMemoryApprovalRepository())
         self.rate_limit_service = rate_limit_service or RateLimitService()
-        self.audit_logger = audit_logger or AuditLogger()
+        self.audit_logger = audit_logger or PersistentAuditLogger()
 
     def authorize(self, agent: AgentRecord | None, capability: str, payload: dict[str, Any] | None = None, *, organization_id: str | None = None, tool_id: str | None = None, provider: str | None = None, model: str | None = None) -> PipelineDecision:
         rate_key = f"{getattr(agent, 'agent_id', 'unknown')}:{capability}"

@@ -238,3 +238,29 @@ class RateLimitModel(Base):
         Index("ix_rate_limits_scope_key", "scope", "key", unique=True),
         Index("ix_rate_limits_reset", "reset_at"),
     )
+
+
+class ApprovalModel(Base):
+    """PostgreSQL-backed approval records."""
+    __tablename__ = "approvals"
+
+    id = mapped_column(Integer, primary_key=True)
+    approval_id = mapped_column(Text, unique=True, nullable=False, index=True)
+    agent_id = mapped_column(Text, nullable=False, index=True)
+    tool_id = mapped_column(Text, nullable=False)
+    action = mapped_column(Text, nullable=False)
+    requested_capability = mapped_column(Text, nullable=False)
+    risk_level = mapped_column(Text, nullable=False, default="LOW")
+    requester_context = mapped_column(JSON, nullable=True)
+    created_at = mapped_column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    expiration_at = mapped_column(DateTime, nullable=True)
+    decision_at = mapped_column(DateTime, nullable=True)
+    approver_identity = mapped_column(Text, nullable=True)
+    status = mapped_column(Text, nullable=False, default="pending")
+    redacted_metadata = mapped_column(JSON, nullable=True)
+    tenant_id = mapped_column(Text, nullable=True, index=True)
+
+    __table_args__ = (
+        Index("ix_approvals_tenant_status", "tenant_id", "status"),
+        Index("ix_approvals_agent_status", "agent_id", "status"),
+    )
