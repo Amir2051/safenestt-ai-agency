@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
 # SafeNestT AI Investigation Engine — Production Startup
 # Runs on port 8002 (localhost only, not Cloudflare-exposed)
+#
+# DO NOT commit real secrets to this file.
+# In production, secrets come from the deployment secret manager
+# (e.g. SOPS-encrypted .env, HashiCorp Vault, or container secrets).
+# This file documents the required variables and their defaults.
+#
+# Required secrets (set via environment or secret manager):
+#   DB_PASSWORD         — PostgreSQL password for DB_USER
+#   HERMES_API_KEY      — Server-to-server API key (registered in engine DB)
+#   SAFENESTT_ENCRYPTION_KEY — Fernet key for encryption at rest
+#   API_KEY_PEPPER       — Pepper used when hashing API keys (must match DB)
+#
+# Generated artifacts (from .gitignore'd secrets file):
+#   See .env.secrets.example for the template.
+
 set -euo pipefail
 
 # ============================================================
@@ -11,32 +26,29 @@ PORT="${PORT:-8002}"
 WORKERS="${WORKERS:-1}"
 
 # ============================================================
-# Environment — MUST be set before starting
-# In production, these come from the deployment secret manager.
-# DO NOT hardcode production secrets here.
+# Environment (defaults for development; override in production)
 # ============================================================
 export MODE="${MODE:-development}"
 export HOST
 export PORT
 export WORKERS
 
-# Database — Supabase Docker PostgreSQL
+# Database — Supabase Docker PostgreSQL (separate from SafeNestT's DB)
 export DB_HOST="${DB_HOST:-127.0.0.1}"
 export DB_PORT="${DB_PORT:-54322}"
 export DB_NAME="${DB_NAME:-safenestt_ai}"
 export DB_USER="${DB_USER:-safenestt_app}"
-export DB_PASSWORD="${DB_PASSWORD:-}"
 export DB_SSL_MODE="${DB_SSL_MODE:-disable}"
 
-# API Key (for inter-service auth)
+# API Key (for inter-service auth — must be registered in engine's api_keys table)
 export HERMES_API_KEY="${HERMES_API_KEY:-}"
 export HERMES_BASE_URL="${HERMES_BASE_URL:-http://127.0.0.1:8002}"
 
-# Encryption
+# Encryption at rest
 export SAFENESTT_ENCRYPTION_KEY="${SAFENESTT_ENCRYPTION_KEY:-}"
 export ENCRYPTION_AT_REST="${ENCRYPTION_AT_REST:-true}"
 
-# API Key pepper (must match what was used to hash registered keys)
+# API key pepper — MUST match what was used to hash registered keys
 export API_KEY_PEPPER="${API_KEY_PEPPER:-safenestt-pepper-change-in-production}"
 
 # Model provider
@@ -46,9 +58,6 @@ export MODEL_NAME="${MODEL_NAME:-qwen3:1.7b}"
 
 # Logging
 export DB_QUERY_LOG="${DB_QUERY_LOG:-false}"
-
-# Fernet key (from secrets manager in production — NOT here)
-# export FERNET_KEY="..." 
 
 echo "=============================================="
 echo "SafeNestT AI Investigation Engine"

@@ -1,0 +1,58 @@
+[Unit]
+Description=SafeNestT AI Investigation Engine
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=ronzoro
+WorkingDirectory=/home/ronzoro/safenestt-ai
+
+# Secrets are injected via environment (production: use secret manager)
+Environment=MODE=development
+Environment=HOST=127.0.0.1
+Environment=PORT=8002
+Environment=WORKERS=1
+Environment=DB_HOST=127.0.0.1
+Environment=DB_PORT=54322
+Environment=DB_NAME=safenestt_ai
+Environment=DB_USER=safenestt_app
+Environment=DB_SSL_MODE=disable
+Environment=MODEL_PROVIDER=ollama
+Environment=OLLAMA_BASE_URL=http://localhost:11434
+Environment=MODEL_NAME=qwen3:1.7b
+Environment=ENCRYPTION_AT_REST=true
+Environment=DB_QUERY_LOG=false
+Environment=API_KEY_PEPPER=safenestt-pepper-change-in-production
+
+# These MUST be set via secret manager in production:
+# Environment=DB_PASSWORD=...
+# Environment=HERMES_API_KEY=...
+# Environment=SAFENESTT_ENCRYPTION_KEY=...
+
+ExecStart=/home/ronzoro/safenestt-platform/apps/api/.venv/bin/python3 \
+    -m uvicorn safenestt.api.app:app \
+    --host ${HOST} \
+    --port ${PORT} \
+    --workers ${WORKERS} \
+    --log-level info \
+    --proxy-headers
+
+Restart=on-failure
+RestartSec=5
+
+# Logging
+StandardOutput=append:/var/log/safenestt/engine.log
+StandardError=append:/var/log/safenestt/engine.log
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/log/safenestt
+PrivateTmp=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
