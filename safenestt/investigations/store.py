@@ -18,7 +18,7 @@ from datetime import datetime, UTC
 from typing import Any
 
 from safenestt.investigations.records import EvidenceRecord, FindingRecord, InvestigationRecord
-from safenestt.persistence.engine import session_scope, create_engine
+from safenestt.persistence.engine import session_scope
 from safenestt.persistence.models import (
     AgentRunModel,
     AuditEventModel,
