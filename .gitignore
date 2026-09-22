@@ -36,3 +36,5 @@ secrets.json
 tmp/
 temp/
 out/
+# Allow secrets template (not actual secrets)
+!env.secrets.example
