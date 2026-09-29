@@ -169,12 +169,17 @@ def run_investigation(*, investigation_id: str, target: str, tenant_id: str | No
         "case_id": investigation_id,
         "created_by": created_by,
         "tenant_id": tenant_id,
+        "organization_id": tenant_id,  # propagate to provider provenance (investigator-level context)
         "indicators": indicators,
         "case_context": case_context,
     }
 
     try:
         orch_result = orchestrator.orchestrate(investigation_schema, orchestrator_inputs)
+        # Persist agent runs created during orchestration
+        agent_runs_data = orch_result.get("agent_runs", [])
+        if agent_runs_data:
+            store.add_agent_runs(investigation_id, agent_runs_data)
     except Exception as exc:
         record.error = {"code": "orchestration_failed", "message": str(exc)}
         try:
@@ -220,38 +225,87 @@ def run_investigation(*, investigation_id: str, target: str, tenant_id: str | No
 
     for run_data in orch_result.get("agent_runs", []):
         tool_calls += len(run_data.get("tool_calls", []))
+        # Provider runs store their result in outputs["provider_result"].
+        # Extract it as a synthetic tool_call so it gets persisted as evidence.
+        provider_result = run_data.get("outputs", {}).get("provider_result")
+        if provider_result and isinstance(provider_result, dict) and provider_result.get("status") == "success":
+            # Build a synthetic tool_call from the provider result so the
+            # evidence loop below picks it up. Provider results use "data.address"
+            # or "data.target" as the target, not the investigation target.
+            _target = (
+                provider_result.get("data", {}).get("address")
+                or provider_result.get("data", {}).get("target")
+                or provider_result.get("data", {}).get("query")
+                or target
+            )
+            synthetic_tc = {
+                "tool_id": provider_result.get("tool_id", ""),
+                "action": provider_result.get("action", ""),
+                "status": "success",
+                "tool_status": "ALLOW",
+                "capability": provider_result.get("action", ""),
+                "result": provider_result.get("data", {}),
+                "result_raw": provider_result,
+            }
+            # Temporarily inject so the evidence loop below sees it.
+            _tc_list = run_data.get("tool_calls", [])
+            if not any(tc.get("tool_id") == synthetic_tc["tool_id"] for tc in _tc_list):
+                _tc_list = _tc_list + [synthetic_tc]
+                # Mutate a copy we control; the original run_data is from orch serialization.
+                run_data["tool_calls"] = _tc_list
 
     for finding_data in orch_result.get("findings", []):
         finding_id = finding_data.get("finding_id") or _stable_id()
-        evidence_ids = finding_data.get("evidence_ids") or []
-        # Create evidence from tool_calls if not already present
+        evidence_ids: list[str] = []
+        finding_type = finding_data.get("finding_type", "AI_INFERENCE")
+        # Create evidence from ALL tool_calls (agent + provider) if not already present.
+        # Provider-backed tool_calls carry their own target in result data.
         for run_data in orch_result.get("agent_runs", []):
             for tc in run_data.get("tool_calls", []):
-                if tc.get("status") == "ALLOW":
+                if tc.get("tool_status") == "ALLOW":
+                    # Determine the evidence target: provider tool_calls carry
+                    # target in the result data; agent tool_calls use investigation target.
+                    tc_result = tc.get("result", {}) or {}
+                    ev_target = (
+                        tc_result.get("target")
+                        or tc_result.get("address")
+                        or tc_result.get("query")
+                        or target
+                    )
                     ev_id = _stable_id()
                     evidence_ids.append(ev_id)
                     evidence_items.append(EvidenceRecord(
                         investigation_id=investigation_id,
                         evidence_id=ev_id,
-                        source=tc.get("capability", "unknown"),
+                        source=tc_result.get("source") or tc.get("capability", "unknown"),
                         source_type="tool",
-                        target=target,
+                        target=ev_target,
                         observed_at=_now(),
-                        data={"tool_call": tc},
-                        confidence=0.7 if tc.get("tool_status") == "success" else 0.0,
-                        provenance=tc.get("capability"),
-                        tool_run_id=_stable_id(),
+                        data={
+                            "tool_call": tc,
+                            "provider": tc_result.get("provider"),
+                            "data": tc_result.get("data"),
+                        },
+                        confidence=tc_result.get("confidence", 0.7 if tc.get("tool_status") == "success" else 0.0),
+                        provenance=tc_result.get("source") or tc.get("capability", ""),
+                        tool_run_id=run_data.get("run_id"),
                     ))
+        # Preserve finding_type — do NOT downgrade EXTERNAL_INTELLIGENCE to AI_INFERENCE.
+        # The RealityChecker evaluates evidence-backed findings; provider-backed findings
+        # get their reality_status from the checker but their type stays EXTERNAL_INTELLIGENCE.
         finding = FindingRecord(
             investigation_id=investigation_id,
             finding_id=finding_id,
             claim=finding_data.get("description") or finding_data.get("title", "Orchestrator finding"),
             evidence_ids=evidence_ids,
-            reality_status="AI_INFERENCE",
+            reality_status=finding_type if finding_type in ("EXTERNAL_INTELLIGENCE", "VERIFIED_EVIDENCE") else "AI_INFERENCE",
             risk_score=finding_data.get("confidence", 0.0),
+            factors={"finding_type": finding_type, **finding_data.get("metadata", {})},
         )
         evaluated = checker.evaluate(finding)
         finding.reality_status = evaluated.reality_status
+        # If the finding was EXTERNAL_INTELLIGENCE and now has evidence, keep the type.
+        # Only the reality_status field is updated by the checker; finding_type stays.
         findings.append(finding)
 
     # Store evidence and findings
@@ -288,6 +342,34 @@ def run_investigation(*, investigation_id: str, target: str, tenant_id: str | No
     record.mark("COMPLETED")
     record = store.update_investigation(record)
 
+    from safenestt.investigations.intelligence import build_dossier_intelligence
+    intelligence = build_dossier_intelligence(
+        target=target,
+        findings=[finding.__dict__ for finding in findings],
+        evidence=[evidence.__dict__ for evidence in evidence_items],
+        indicators=indicators,
+    )
+
+    # Hermes→Base44 bridge: transform persisted records for Base44 consumption
+    try:
+        from safenestt.bridge.transformation import bridge_investigation
+        bridge_result = bridge_investigation(
+            hermes_inv=record,
+            findings=findings,
+            evidence=evidence_items,
+            case_id=investigation_id,
+            provider_tool_calls=orch_result.get("agent_runs", []),
+        )
+        intelligence["bridge"] = {
+            "case_id": bridge_result.case_id,
+            "case_evidence_items_count": len(bridge_result.case_evidence_items),
+            "graph_nodes_count": len(bridge_result.graph_nodes),
+            "graph_edges_count": len(bridge_result.graph_edges),
+            "tool_run_records_count": len(bridge_result.tool_run_records),
+        }
+    except Exception as bridge_err:
+        intelligence["bridge_error"] = str(bridge_err)
+
     return {
         "investigation_id": investigation_id,
         "status": "COMPLETED",
@@ -295,9 +377,11 @@ def run_investigation(*, investigation_id: str, target: str, tenant_id: str | No
         "tenant_id": tenant_id,
         "created_by": created_by,
         "tool_calls": tool_calls,
+        "agent_runs": orch_result.get("agent_runs", []),
         "evidence": [evidence.__dict__ for evidence in evidence_items],
         "findings": [finding.__dict__ for finding in findings],
         "risk": risk,
+        "intelligence": intelligence,
         "model_provider": getattr(provider, "provider_name", None),
         "model": getattr(provider, "default_model", None),
     }

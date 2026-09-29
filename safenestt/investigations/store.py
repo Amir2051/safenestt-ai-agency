@@ -18,7 +18,7 @@ from datetime import datetime, UTC
 from typing import Any
 
 from safenestt.investigations.records import EvidenceRecord, FindingRecord, InvestigationRecord
-from safenestt.persistence.engine import session_scope
+from safenestt.persistence.engine import session_scope, create_engine
 from safenestt.persistence.models import (
     AgentRunModel,
     AuditEventModel,
@@ -187,7 +187,7 @@ class PersistentInvestigationStore:
     def add_finding(self, finding: FindingRecord) -> FindingRecord:
         if not self._tenant_id or not self._key_fingerprint:
             raise TenantIsolationError("Tenant context required for database access")
-        
+
         with self._session() as session:
             model = FindingModel(
                 finding_id=finding.finding_id,
@@ -196,12 +196,48 @@ class PersistentInvestigationStore:
                 evidence_ids=finding.evidence_ids,
                 reality_status=finding.reality_status,
                 risk_score=finding.risk_score,
-                factors=encrypt_value(finding.factors),
+                factors=encrypt_value(finding.factors) if finding.factors else None,
             )
             session.add(model)
             session.flush()
-            
+
             return finding
+
+    def add_agent_runs(self, investigation_id: str, agent_runs_data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Persist agent runs from orchestrator output. Returns list of persisted run_ids."""
+        if not self._tenant_id or not self._key_fingerprint:
+            raise TenantIsolationError("Tenant context required for database access")
+
+        persisted: list[dict[str, Any]] = []
+        with self._session() as session:
+            from sqlalchemy import select
+            for run_data in agent_runs_data:
+                run_id = run_data.get("run_id")
+                if not run_id:
+                    continue
+                existing = session.execute(
+                    select(AgentRunModel).where(AgentRunModel.run_id == run_id)
+                ).scalar_one_or_none()
+                if existing:
+                    existing.status = run_data.get("status", existing.status)
+                    existing.started_at = run_data.get("started_at") or existing.started_at
+                    existing.completed_at = run_data.get("completed_at") or existing.completed_at
+                    existing.error = run_data.get("error") or existing.error
+                else:
+                    session.add(AgentRunModel(
+                        run_id=run_id,
+                        investigation_id=investigation_id,
+                        agent_type=run_data.get("agent_type", "unknown"),
+                        status=run_data.get("status", "unknown"),
+                        started_at=run_data.get("started_at"),
+                        completed_at=run_data.get("completed_at"),
+                        model_provider=run_data.get("model_provider"),
+                        model_name=run_data.get("model_name"),
+                        error=run_data.get("error"),
+                    ))
+                persisted.append({"run_id": run_id, "agent_type": run_data.get("agent_type", "unknown"), "status": run_data.get("status", "unknown")})
+            session.flush()
+        return persisted
     
     def list_findings(self, investigation_id: str) -> list[FindingRecord]:
         if not self._tenant_id or not self._key_fingerprint:
