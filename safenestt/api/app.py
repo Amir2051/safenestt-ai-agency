@@ -243,6 +243,30 @@ def start_investigation(
         raise _handle_tenant_isolation(exc)
     if not record:
         raise _to_api_error("not_found", "investigation_not_found", 404)
+
+    # A SafeNestT case may be investigated repeatedly. COMPLETED/FAILED/
+    # CANCELLED are terminal *runs*, not terminal cases. Requeue the same
+    # investigation id for a direct API rerun, optionally accepting refreshed
+    # case/target context from the caller.
+    if record.status in {"COMPLETED", "FAILED", "CANCELLED"}:
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        refreshed_target = payload.get("target") if isinstance(payload, dict) else None
+        refreshed_targets = payload.get("targets") if isinstance(payload, dict) else None
+        narrative = payload.get("narrative") if isinstance(payload, dict) else None
+        if refreshed_target or refreshed_targets or narrative:
+            import json
+            record.target = json.dumps({
+                "target": refreshed_target or {"type": "narrative", "value": record.target or "investigation"},
+                "targets": refreshed_targets or [],
+                "narrative": narrative,
+            })
+        record.error = None
+        record.mark("QUEUED")
+        record = service.update_investigation(record)
+
     if record.status != "QUEUED":
         raise _to_api_error("invalid_state", f"investigation_already_{record.status.lower()}", 409)
     try:
