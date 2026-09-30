@@ -58,7 +58,7 @@ class InvestigationRecord:
         "WAITING_FOR_TOOL": {"RUNNING", "VERIFYING", "FAILED", "CANCELLED"},
         "VERIFYING": {"CALCULATING_RISK", "FAILED", "CANCELLED"},
         "CALCULATING_RISK": {"COMPLETED", "FAILED", "CANCELLED"},
-        "COMPLETED": set(),
+        "COMPLETED": {"QUEUED"},
         "FAILED": {"QUEUED"},
         "CANCELLED": {"QUEUED"},
     }

@@ -15,12 +15,17 @@ def test_failed_investigation_can_be_rerun():
     assert first.status_code == 200
     assert first.json()["investigation_id"] == investigation_id
 
-    second = client.post(f"/v1/investigations/{investigation_id}/start", headers={"X-API-Key": "test-tenant"})
-    assert second.status_code == 409
+    second = client.post(
+        f"/v1/investigations/{investigation_id}/start",
+        headers={"X-API-Key": "test-tenant"},
+        json={"target": {"type": "domain", "value": "example.org"}, "targets": [{"type": "domain", "value": "example.org"}], "narrative": "Updated case information"},
+    )
+    assert second.status_code == 200
+    assert second.json()["investigation_id"] == investigation_id
     assert second.json()["detail"]["code"] == "invalid_state"
 
 
-def test_completed_investigation_blocks_duplicate_start():
+def test_completed_investigation_can_be_rerun():
     client = TestClient(app)
     create = client.post("/v1/investigations", json={"target": {"type": "domain", "value": "example.com"}, "investigation_type": "cybersecurity"}, headers={"X-API-Key": "test-tenant"})
     assert create.status_code == 200
