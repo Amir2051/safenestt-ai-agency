@@ -15,6 +15,17 @@ from safenestt.schemas.findings import AgentRun, Finding, Investigation, Provena
 from safenestt.security.permissions import PermissionManager
 
 
+SENTRA_ENGINE_NAME = "SafeNestT SENTRA"
+SENTRA_AGENT_NAMES = {
+    "evidence": "SENTRA Evidence Investigator",
+    "osint": "SENTRA OSINT Investigator",
+    "threat_intel": "SENTRA Security Intelligence Investigator",
+    "crypto": "SENTRA Crypto Intelligence Investigator",
+    "fraud_analysis": "SENTRA Fraud Investigator",
+    "report": "SENTRA Intelligence Report Generator",
+}
+
+
 class InvestigationOrchestrator:
     def __init__(self, permission_manager: PermissionManager | None = None) -> None:
         self.permission_manager = permission_manager or PermissionManager()
@@ -71,6 +82,7 @@ class InvestigationOrchestrator:
         return {
             "investigation_id": investigation.investigation_id,
             "status": "completed",
+            "agentic_engine": SENTRA_ENGINE_NAME,
             "agent_runs": [self._serialize_run(r) for r in runs],
             "findings": [self._serialize_finding(f) for f in findings],
             "approved_findings": len(approved),
@@ -85,7 +97,7 @@ class InvestigationOrchestrator:
         agent.allowed_tools = getattr(agent_cls, "allowed_tools", [])
         agent.agent = AgentRecord(
             agent_id=agent_id,
-            name=f"{role.capitalize()} Agent",
+            name=SENTRA_AGENT_NAMES.get(role, f"SENTRA {role.replace('_', ' ').title()} Agent"),
             capabilities=agent.allowed_tools,
             status=AgentStatus.ACTIVE,
             enabled=True,
@@ -138,6 +150,7 @@ class InvestigationOrchestrator:
             "error": run.error,
             "retry_count": run.retry_count,
             "tool_calls": run.tool_calls,
+            "agentic_engine": SENTRA_ENGINE_NAME,
         }
 
     @staticmethod
