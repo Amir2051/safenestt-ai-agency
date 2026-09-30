@@ -37,7 +37,7 @@ def _validate_production_security() -> None:
 
 _validate_production_security()
 
-app = FastAPI(title="SafeNestT AI Engine", version="0.1.0")
+app = FastAPI(title="SafeNestT SENTRA — Agentic Investigation Intelligence", version="0.1.0")
 _rate_limiter = RateLimitService()
 
 
@@ -197,6 +197,7 @@ def health() -> dict[str, Any]:
         },
         "environment": {
             "api_version": "0.1.0",
+            "agentic_engine": "SafeNestT SENTRA",
             "mode": os.getenv("MODE", "development"),
             "encryption_at_rest": is_encryption_enabled(),
         },
