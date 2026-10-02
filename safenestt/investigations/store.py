@@ -195,6 +195,7 @@ class PersistentInvestigationStore:
                 claim=encrypt_value(finding.claim),
                 evidence_ids=finding.evidence_ids,
                 reality_status=finding.reality_status,
+                agent=getattr(finding, "agent", None),
                 risk_score=finding.risk_score,
                 factors=encrypt_value(finding.factors) if finding.factors else None,
             )

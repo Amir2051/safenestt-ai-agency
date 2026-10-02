@@ -92,5 +92,8 @@ class FindingRecord:
     evidence_ids: list[str] = field(default_factory=list)
     reality_status: str = "AI_INFERENCE"
     risk_score: float = 0.0
+    # Attribution. Defaulted so existing construction sites are unaffected; the
+    # persistence layer reads this via getattr(finding, "agent", None).
+    agent: str = ""
     factors: dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=datetime.utcnow)

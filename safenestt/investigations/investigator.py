@@ -320,10 +320,15 @@ def run_investigation(*, investigation_id: str, target: str, tenant_id: str | No
             finding_id=_stable_id(),
             claim=model_claim[:4000],
             evidence_ids=[item.evidence_id for item in evidence_items],
-            reality_status="AI_INFERENCE",
             risk_score=0.5,
+            agent="investigator",
             factors={"model": getattr(provider, "default_model", None), "provider": getattr(provider, "provider_name", None)},
         )
+        # Adjudicate through the same RealityChecker the orchestrator path uses
+        # (see above). Previously this path hardcoded reality_status="AI_INFERENCE"
+        # and persisted without evaluation, so model findings were never validated.
+        evaluated_model = checker.evaluate(model_finding)
+        model_finding.reality_status = evaluated_model.reality_status
         store.add_finding(model_finding)
         findings.append(model_finding)
 

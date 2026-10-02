@@ -12,6 +12,11 @@ build/
 *.egg-info/
 
 # Env / secrets
+
+# Base44 <-> Hermes credential material (exact paths only — do not broaden
+# to *.txt / *.key, which would hide legitimate source and fixture files).
+safenestt/security/hermes_base44_api_key.txt
+safenestt/security/hermes_base44_key.txt
 .env
 .env.*
 .env.local
