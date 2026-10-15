@@ -160,6 +160,7 @@ class AuditEventModel(Base):
 
     id = mapped_column(Integer, primary_key=True)
     event_id = mapped_column(Text, unique=True, nullable=False, index=True)
+    tenant_id = mapped_column(Text, nullable=False, index=True)
     investigation_id = mapped_column(Text, ForeignKey("investigations.investigation_id"), nullable=True, index=True)
     actor_type = mapped_column(Text, nullable=False)
     actor_id = mapped_column(Text, nullable=True)

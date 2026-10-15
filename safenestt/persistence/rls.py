@@ -200,14 +200,17 @@ CREATE POLICY graph_edges_insert ON graph_edges
     ));
 
 CREATE POLICY audit_events_policy ON audit_events FOR ALL
-    USING (investigation_id IN (
-        SELECT investigation_id FROM investigations
-        WHERE tenant_id = get_current_tenant()
-    ))
-    WITH CHECK (investigation_id IN (
-        SELECT investigation_id FROM investigations
-        WHERE tenant_id = get_current_tenant()
-    ));
+    USING (tenant_id = get_current_tenant())
+    WITH CHECK (
+        tenant_id = get_current_tenant()
+        AND (
+            investigation_id IS NULL
+            OR investigation_id IN (
+                SELECT investigation_id FROM investigations
+                WHERE tenant_id = get_current_tenant()
+            )
+        )
+    );
 
 -- Fix: establish_tenant_context must look up by fingerprint (SHA-256),
 -- not key_hash (Argon2). Argon2 hashes are non-deterministic so they

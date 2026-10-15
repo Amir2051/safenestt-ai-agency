@@ -13,6 +13,7 @@ from safenestt.investigation.orchestrator import InvestigationOrchestrator
 from safenestt.registry import AgentRecord, AgentStatus, RiskLevel
 from safenestt.schemas.findings import Investigation
 from safenestt.security.permissions import PermissionManager
+from safenestt.security.audit import AuditLogger
 
 
 class FakeAgentRecord:
@@ -25,7 +26,9 @@ class FakeAgentRecord:
 
 
 def _permission_manager():
-    pm = PermissionManager()
+    # Agent unit tests verify agent behavior, not audit persistence — use the
+    # in-memory audit logger so they don't require a tenant-scoped DB session.
+    pm = PermissionManager(audit_logger=AuditLogger())
     for agent_id in ["test-agent", "evidence", "osint", "threat_intel", "crypto", "fraud_analysis", "report"]:
         pm.granted_permissions[agent_id] = {"intel.read", "threat.read", "crypto.read", "*"}
     return pm

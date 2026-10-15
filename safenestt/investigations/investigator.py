@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 from safenestt.investigations.records import EvidenceRecord, FindingRecord, InvestigationRecord, InvalidStatusError
 from safenestt.investigations.risk import calculate_risk
 from safenestt.investigations.store import PersistentInvestigationStore, TenantIsolationError
+from safenestt.persistence.store import PersistentAuditLogger
 from safenestt.investigations.reality import RealityChecker
 from safenestt.model.provider import ModelProvider, ModelRequest, ModelResponse
 from safenestt.registry import AgentRecord, AgentRegistry, AgentStatus, RiskLevel
@@ -119,7 +120,9 @@ def run_investigation(
 ) -> dict[str, Any]:
     if store is None:
         store = PersistentInvestigationStore(tenant_id=tenant_id, key_fingerprint=key_fingerprint)
-    permission_manager = PermissionManager()
+    permission_manager = PermissionManager(
+        audit_logger=PersistentAuditLogger(tenant_id=tenant_id, key_fingerprint=key_fingerprint)
+    )
     tool_interface = ToolInterface(permission_manager=permission_manager)
     checker = RealityChecker(evidence_lookup=lambda investigation_id, evidence_id: next((e for e in store.list_evidence(investigation_id) if e.evidence_id == evidence_id), None))
     agent = AgentRecord(agent_id="investigator", name="Investigator", enabled=True, status=AgentStatus.ACTIVE, capabilities=["tools.dns.lookup.lookup"], risk_level=RiskLevel.LOW)
@@ -185,7 +188,11 @@ def run_investigation(
     )
 
     human_target, indicators, case_context = _case_context(record.target or target)
-    orchestrator = InvestigationOrchestrator(permission_manager=PermissionManager())
+    orchestrator = InvestigationOrchestrator(
+        permission_manager=PermissionManager(
+            audit_logger=PersistentAuditLogger(tenant_id=tenant_id, key_fingerprint=key_fingerprint)
+        )
+    )
     orchestrator_inputs: dict[str, Any] = {
         "target": human_target,
         "investigation_id": investigation_id,

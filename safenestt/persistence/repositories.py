@@ -8,7 +8,7 @@ from datetime import datetime, UTC
 from typing import Any
 
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 
 from safenestt.persistence.engine import session_scope
 from sqlalchemy.orm import Session
@@ -293,6 +293,18 @@ class AuditEventRepository:
         if inv_id is None and hasattr(event, "metadata") and event.metadata:
             inv_id = event.metadata.get("investigation_id")
 
+        # Get tenant_id from the current tenant context (DB GUC: current_setting('app.current_tenant'))
+        tenant_id = self._session.execute(
+            text("SELECT get_current_tenant()")
+        ).scalar()
+        if tenant_id is None:
+            raise RuntimeError(
+                "audit_events.insert: tenant_id is NULL — "
+                "current_setting('app.current_tenant') returned NULL. "
+                "Init the tenant context before logging audit events."
+            )
+
+
         # event_id must be unique per ROW. Callers generate deterministic ids
         # ("auth-deny", f"rate-deny-{key}", f"auth-deny-{agent}-{capability}", ...),
         # so any repeated event -- two auth denials for one capability, a retried
@@ -312,6 +324,7 @@ class AuditEventRepository:
         model = AuditEventModel(
             event_id=event_id,
             investigation_id=inv_id,
+            tenant_id=tenant_id,
             actor_type=event.actor_type,
             actor_id=event.actor_id,
             action=event.action,

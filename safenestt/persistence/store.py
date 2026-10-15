@@ -66,9 +66,12 @@ class PersistentAuditLogger:
     import-time dependencies on engine initialization.
     """
 
-    def __init__(self, store: PersistentStore | None = None) -> None:
+    def __init__(self, store: PersistentStore | None = None,
+                 tenant_id: str | None = None, key_fingerprint: str | None = None) -> None:
         self._store = store
         self._initialized = store is not None
+        self._tenant_id = tenant_id
+        self._key_fingerprint = key_fingerprint
 
     def _ensure_store(self) -> PersistentStore:
         if not self._initialized:
@@ -78,7 +81,15 @@ class PersistentAuditLogger:
         return self._store
 
     def record(self, event: Any) -> Any:
-        self._ensure_store().audit.record(event)
+        store = self._ensure_store()
+        # Audit events are written on this logger's own session. Establish the
+        # tenant context on that session so RLS permits the insert and the row
+        # is tenant-scoped (authorization/system events have no investigation_id).
+        if self._tenant_id and self._key_fingerprint:
+            from safenestt.persistence.rls import set_tenant_context
+            set_tenant_context(store.audit._session.connection(),
+                               self._tenant_id, self._key_fingerprint)
+        store.audit.record(event)
         return event
 
     def recent(self, limit: int = 100) -> list[Any]:

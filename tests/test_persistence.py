@@ -60,8 +60,14 @@ _TEST_KEY_FP_ANOTHER_TENANT = hashlib.sha256(b"test-another-tenant-key-pqrst").h
 
 
 
+# Track every app engine created during a test so the fresh_db teardown can
+# dispose them and avoid connection accumulation across the suite.
+_engines: list = []
+
+
 def _app_session():
     engine = sa_create_engine(_APP_URL)
+    _engines.append(engine)
     return sessionmaker(bind=engine)()
 
 
@@ -773,7 +779,7 @@ class TestTenantIsolation:
     def test_rls_blocks_child_table_cross_tenant_access(self, fresh_db):
         # Use the application role (has table-level privileges and RLS policies)
         role_name = "safenestt_app"
-        role_pass = "safenestt_app"
+        role_pass = _APP_PASS
         app_dsn = f"postgresql://{role_name}:{role_pass}@127.0.0.1:55432/safenestt_ai_test"
 
         # fresh_db (autouse) creates the tenant tables, then applies RLS policies.
