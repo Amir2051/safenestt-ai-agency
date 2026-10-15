@@ -68,7 +68,21 @@ class ThreatIntelAgent(BaseAgent):
     def _sanitize_tool_call(self, capability: str, result: dict[str, Any]) -> dict[str, Any]:
         safe = dict(result)
         safe.pop("metadata", None)
-        return {"capability": capability, "status": safe.get("status"), "tool_status": safe.get("status")}
+        # Adapter returns flat structure; top-level keys ARE the result data
+        result_status = safe.get("status")
+        allowed = result_status == "success"
+        return {
+            "capability": capability,
+            "status": safe.get("status"),
+            "tool_status": "ALLOW" if allowed else result_status,
+            "source": safe.get("source"),
+            "result": {
+                "source": safe.get("source"),
+                "data": safe.get("data", {}),
+                "confidence": safe.get("confidence", 0.65 if allowed else 0.0),
+                "target": safe.get("target") or safe.get("query") or "",
+            },
+        }
 
     def _to_finding(self, run: AgentRun, capability: str, result: dict[str, Any]) -> Finding | None:
         data = result.get("data") or {}

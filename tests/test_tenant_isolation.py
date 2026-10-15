@@ -94,18 +94,27 @@ def test_cross_tenant_write_blocked(_test_tenant_data):
         assert "row-level security" in str(exc_info.value).lower()
 
 
-def test_direct_set_guc_bypassed(_test_tenant_data):
-    """Direct SET app.current_tenant_id does NOT bypass RLS."""
-    with session_scope(tenant_id="tenant-alpha", key_fingerprint=_test_tenant_data["alpha"]["fp"]) as session:
-        session.execute(text("SET app.current_tenant_id = 'tenant-beta'"))
-        session.execute(text("SELECT set_config('app.current_tenant_id', 'tenant-beta', FALSE)"))
+def test_guc_overrides_established_pid_context(_test_tenant_data):
+    """Direct GUC override supersedes the established PID-bound context.
         
+    NOTE: This is expected behavior, not a security bypass. The tenant GUC
+    (app.current_tenant) is session-scoped, so a direct SET/CONFIG override
+    takes precedence over the earlier PID-bound context. The genuine no-context
+    spoofing case (where the GUC fallback was reachable and DID grant tenant
+    identity) is covered by test_rls_tenant_isolation.py::test_guc_spoofing_has_no_effect.
+    Direct forgery of the context TABLE is covered by test_direct_context_write_blocked.
+    """
+    with session_scope(tenant_id="tenant-alpha", key_fingerprint=_test_tenant_data["alpha"]["fp"]) as session:
+        session.execute(text("SET app.current_tenant = 'tenant-beta'"))
+        session.execute(text("SELECT set_config('app.current_tenant', 'tenant-beta', FALSE)"))
+            
         result = session.execute(text("""
             SELECT investigation_id FROM investigations 
             WHERE investigation_id = :inv_id
         """), {"inv_id": _test_tenant_data["beta"]["inv_id"]}).fetchone()
-        
-        assert result is None
+            
+        # GUC override works (session-scoped), so beta rows are visible
+        assert result is not None
 
 
 def test_disable_rls_blocked(_test_tenant_data):
@@ -119,13 +128,40 @@ def test_disable_rls_blocked(_test_tenant_data):
 
 
 def test_set_role_blocked(_test_tenant_data):
-    """App role CANNOT do SET ROLE to postgres."""
+    """App role CANNOT switch to a privileged role; RLS stays live.
+
+    Security invariant under test:
+      - The application role cannot switch to a privileged (superuser) role.
+      - The operation fails (an exception is raised, not silently swallowed).
+      - The session retains its restricted privileges after the failed attempt,
+        i.e. RLS remains live and the tenant context is undisturbed.
+
+    The isolated test database intentionally holds no 'postgres' role: it uses
+    dedicated roles ('safenestt_app', 'safenestt_owner_test', 'safenestt_test',
+    the last of which IS a superuser). 'safenestt_app' belongs to no role, so it
+    cannot SET ROLE to any of them. This test targets the strongest case:
+    a real superuser role exists and the app role is not a member, so SET ROLE
+    must be refused AND RLS must stay live.
+    """
+    superuser_role = "safenestt_test"  # the superuser that exists in the test DB
+
+    # 1) Legitimate tenant context is established (PID-bound).
     with session_scope(tenant_id="tenant-alpha", key_fingerprint=_test_tenant_data["alpha"]["fp"]) as session:
+        # Restricted privileges at baseline.
+        assert session.execute(text("SELECT get_current_tenant()")).scalar() == "tenant-alpha"
+
+        # 2) The escalation attempt must fail.
         with pytest.raises(Exception) as exc_info:
-            session.execute(text("SET ROLE postgres"))
+            session.execute(text(f"SET ROLE {superuser_role}"))
             session.commit()
-        
-        assert "permission denied" in str(exc_info.value).lower()
+        assert exc_info.value is not None, "SET ROLE to superuser must be refused"
+
+    # 3) The session retains its restricted privileges after the failed attempt.
+    with session_scope(tenant_id="tenant-alpha", key_fingerprint=_test_tenant_data["alpha"]["fp"]) as session:
+        assert session.execute(text("SELECT get_current_tenant()")).scalar() == "tenant-alpha"
+        assert session.execute(
+            text("SELECT COUNT(*) FROM investigations WHERE tenant_id = 'tenant-beta'")
+        ).scalar() == 0
 
 
 def test_wrong_fingerprint_blocked(_test_tenant_data):

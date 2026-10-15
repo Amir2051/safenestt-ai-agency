@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import pytest
 import psycopg2
 import uuid
 import os
 from datetime import datetime, UTC
-from sqlalchemy import text, create_engine as sa_create_engine
+from sqlalchemy import text
+from safenestt.persistence.engine import create_engine as sa_create_engine
 from sqlalchemy.orm import sessionmaker, Session
 
 from safenestt.persistence.models import (
@@ -28,34 +30,70 @@ from safenestt.persistence.repositories import (
 from safenestt.persistence.rls import apply_rls_policies, set_tenant_context
 from safenestt.investigations.records import InvestigationRecord, FindingRecord, EvidenceRecord
 
-# DB connection URLs - passwords from env for security, with dev fallbacks
-_OWNER_PASS = os.getenv("SAFENESTT_OWNER_PASSWORD", os.getenv("POSTGRES_PASSWORD", "postgres"))
-_APP_PASS = os.getenv("SAFENESTT_DB_PASSWORD", os.getenv("DB_PASSWORD", "safenestt_app_pass"))
-OWNER_URL = f"postgresql://postgres:{_OWNER_PASS}@172.19.0.11:5432/safenestt_ai"
-APP_URL = f"postgresql://safenestt_app:{_APP_PASS}@172.19.0.11:5432/safenestt_ai"
+# SECURITY FIX (2026-10-04): these URLs MUST target the isolated test instance
+# (127.0.0.1:55432, /safenestt_ai_test), never the production database. A
+# hardcoded production DSN here broke the full-suite unique constraint because
+# this file's seed statements insert deterministic api_keys rows into the
+# production database. The conftest.py isolation guard and the
+# isolation_guard.py connection-level guard independently re-check the real
+# DSN at the connection boundary, so a regression here is blocked before a
+# socket is opened.
+# SECURITY FIX: driver spec is explicit (psycopg2) because the SQLAlchemy 2.1
+# default driver (psycopg) is not installed in the test environment.
+_OWNER_PASS = os.getenv("SAFENESTT_OWNER_PASSWORD", "safenestt_test_local_only")
+_APP_PASS = os.getenv("SAFENESTT_DB_PASSWORD", "safenestt_test_local_only")
+_DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+_DB_PORT = os.getenv("SAFENESTT_TEST_PORT", "55432")
+_DB_NAME = os.getenv("DB_NAME", "safenestt_ai_test")
+_OWNER_DSN = f"postgresql://safenestt_owner_test:{_OWNER_PASS}@{_DB_HOST}:{_DB_PORT}/{_DB_NAME}"
+_OWNER_URL = f"postgresql+psycopg2://safenestt_owner_test:{_OWNER_PASS}@{_DB_HOST}:{_DB_PORT}/{_DB_NAME}"
+_APP_URL = f"postgresql+psycopg2://safenestt_app:{_APP_PASS}@{_DB_HOST}:{_DB_PORT}/{_DB_NAME}"
+
+# Deterministic test API key fingerprints — SHA-256 of a fixed raw key.
+# match set_tenant_context() -> establish_tenant_context() -> SHA-256 key_fingerprint lookup in api_keys.
+_TEST_KEY_FP_ORG1 = hashlib.sha256(b"test-lifecycle-key-12345").hexdigest()
+_TEST_KEY_FP_ORG2 = hashlib.sha256(b"test-lifecycle-org2-key-67890").hexdigest()
+_TEST_KEY_FP_TENANT_A = hashlib.sha256(b"test-tenant-a-key-abcde").hexdigest()
+_TEST_KEY_FP_TENANT_B = hashlib.sha256(b"test-tenant-b-key-fghij").hexdigest()
+_TEST_KEY_FP_SOME_TENANT = hashlib.sha256(b"test-some-tenant-key-klmno").hexdigest()
+_TEST_KEY_FP_ANOTHER_TENANT = hashlib.sha256(b"test-another-tenant-key-pqrst").hexdigest()
+
 
 
 def _app_session():
-    engine = sa_create_engine(APP_URL)
+    engine = sa_create_engine(_APP_URL)
     return sessionmaker(bind=engine)()
 
 
 @pytest.fixture(autouse=True)
 def fresh_db():
     # DDL via owner
-    conn = psycopg2.connect(OWNER_URL)
+    conn = psycopg2.connect(_OWNER_DSN)
     conn.autocommit = True
     cur = conn.cursor()
-    cur.execute("DROP TABLE IF EXISTS audit_events, reports, evidence, findings, agent_runs, investigations CASCADE")
+    # All tables are dropped in setup and teardown so the next test starts with
+    # an empty api_keys table and no key_fingerprint values. The security tests
+    # seed api_keys with deterministic SHA-256 key_fingerprints; without dropping
+    # api_keys / api_key_audit, the unique index ix_api_keys_key_fingerprint
+    # accumulates duplicate values as tests repeat, causing the full-suite
+    # failures ("duplicate key value violates unique constraint
+    # \"ix_api_keys_key_fingerprint\"").
+    cur.execute(
+        "DROP TABLE IF EXISTS api_key_audit, api_keys, audit_events, reports, "
+        "evidence, findings, agent_runs, investigations CASCADE"
+    )
     cur.close()
     conn.close()
 
-    owner_engine = sa_create_engine(OWNER_URL)
+    owner_engine = sa_create_engine(_OWNER_URL)
     Base.metadata.create_all(owner_engine)
     apply_rls_policies(owner_engine)
+    # Close engine to release database connections — do not leak connections
+    # between tests, which can cause timeouts and connection exhaustion.
+    owner_engine.dispose()
 
     # Grant privileges
-    conn = psycopg2.connect(OWNER_URL)
+    conn = psycopg2.connect(_OWNER_DSN)
     conn.autocommit = True
     cur = conn.cursor()
     cur.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO safenestt_app")
@@ -63,12 +101,52 @@ def fresh_db():
     cur.close()
     conn.close()
 
+    # Seed deterministic test API keys for every tenant used in set_tenant_context()
+    # lookups so the SHA-256 key_fingerprint lookup succeeds. Test-only setup.
+    _TEST_KEYS = [
+        ("org-1", b"test-lifecycle-key-12345", "org-1"),
+        ("org-2", b"test-lifecycle-org2-key-67890", "org-2"),
+        ("tenant-a", b"test-tenant-a-key-abcde", "tenant-a"),
+        ("tenant-b", b"test-tenant-b-key-fghij", "tenant-b"),
+        ("some-tenant", b"test-some-tenant-key-klmno", "some-tenant"),
+        ("another-tenant", b"test-another-tenant-key-pqrst", "another-tenant"),
+    ]
+    with owner_engine.connect() as conn:
+        for _tid, _raw, _tenant in _TEST_KEYS:
+            _fp = hashlib.sha256(_raw).hexdigest()
+            conn.execute(
+                text(
+                    "INSERT INTO api_keys "
+                    "(key_hash, key_fingerprint, tenant_id, name, active, revoked, scopes, created_at, use_count) "
+                    "VALUES (:kh, :fp, :tid, :name, TRUE, FALSE, '[]'::json, NOW(), 0)"
+                ),
+                {
+                    "fp": _fp,
+                    "kh": "placeholder:" + _fp,
+                    "tid": _tenant,
+                    "name": f"Test Key {'_'.join(_tid.split('-'))}",
+                },
+            )
+        conn.commit()
+
     yield
 
-    conn = psycopg2.connect(OWNER_URL)
+    # Teardown: dispose all app engines
+    try:
+        for engine in _engines:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+        _engines.clear()
+    finally:
+        conn = psycopg2.connect(_OWNER_DSN)
     conn.autocommit = True
     cur = conn.cursor()
-    cur.execute("DROP TABLE IF EXISTS audit_events, reports, evidence, findings, agent_runs, investigations CASCADE")
+    cur.execute(
+        "DROP TABLE IF EXISTS api_key_audit, api_keys, audit_events, reports, "
+        "evidence, findings, agent_runs, investigations CASCADE"
+    )
     cur.close()
     conn.close()
 
@@ -77,7 +155,7 @@ class TestInvestigationRepository:
     def test_create_and_get(self, fresh_db):
         s = _app_session()
         try:
-            set_tenant_context(s.connection(), "org-1")
+            set_tenant_context(s.connection(), "org-1", _TEST_KEY_FP_ORG1)
             repo = InvestigationRepository(s)
             record = InvestigationRecord(
                 investigation_id="inv-1", tenant_id="org-1", created_by="user-1",
@@ -96,7 +174,7 @@ class TestInvestigationRepository:
     def test_update_status(self, fresh_db):
         s = _app_session()
         try:
-            set_tenant_context(s.connection(), "org-1")
+            set_tenant_context(s.connection(), "org-1", _TEST_KEY_FP_ORG1)
             repo = InvestigationRepository(s)
             record = InvestigationRecord(
                 investigation_id="inv-1", tenant_id="org-1", created_by="user-1",
@@ -116,7 +194,7 @@ class TestInvestigationRepository:
         # Create data for two tenants using separate sessions
         s1 = _app_session()
         try:
-            set_tenant_context(s1.connection(), "org-1")
+            set_tenant_context(s1.connection(), "org-1", _TEST_KEY_FP_ORG1)
             repo1 = InvestigationRepository(s1)
             for i in range(3):
                 rec = InvestigationRecord(
@@ -130,7 +208,7 @@ class TestInvestigationRepository:
 
         s2 = _app_session()
         try:
-            set_tenant_context(s2.connection(), "org-2")
+            set_tenant_context(s2.connection(), "org-2", _TEST_KEY_FP_ORG2)
             repo2 = InvestigationRepository(s2)
             rec2 = InvestigationRecord(
                 investigation_id="inv-other", tenant_id="org-2", created_by="user-1",
@@ -144,7 +222,7 @@ class TestInvestigationRepository:
         # Verify org-1 sees only its data
         s1 = _app_session()
         try:
-            set_tenant_context(s1.connection(), "org-1")
+            set_tenant_context(s1.connection(), "org-1", _TEST_KEY_FP_ORG1)
             repo1 = InvestigationRepository(s1)
             org1 = repo1.list_by_tenant(tenant_id="org-1")
             assert len(org1) == 3
@@ -154,7 +232,7 @@ class TestInvestigationRepository:
         # Verify org-2 sees only its data
         s2 = _app_session()
         try:
-            set_tenant_context(s2.connection(), "org-2")
+            set_tenant_context(s2.connection(), "org-2", _TEST_KEY_FP_ORG2)
             repo2 = InvestigationRepository(s2)
             org2 = repo2.list_by_tenant(tenant_id="org-2")
             assert len(org2) == 1
@@ -166,7 +244,7 @@ class TestAgentRunRepository:
     def test_create_and_complete(self, fresh_db):
         s = _app_session()
         try:
-            set_tenant_context(s.connection(), "org-1")
+            set_tenant_context(s.connection(), "org-1", _TEST_KEY_FP_ORG1)
             inv_repo = InvestigationRepository(s)
             inv = inv_repo.create(InvestigationRecord(
                 investigation_id="inv-1", tenant_id="org-1", created_by="user-1",
@@ -188,7 +266,7 @@ class TestAgentRunRepository:
     def test_increment_retry(self, fresh_db):
         s = _app_session()
         try:
-            set_tenant_context(s.connection(), "org-1")
+            set_tenant_context(s.connection(), "org-1", _TEST_KEY_FP_ORG1)
             inv_repo = InvestigationRepository(s)
             inv = inv_repo.create(InvestigationRecord(
                 investigation_id="inv-1", tenant_id="org-1", created_by="user-1",
@@ -206,7 +284,7 @@ class TestAgentRunRepository:
     def test_list_by_investigation(self, fresh_db):
         s = _app_session()
         try:
-            set_tenant_context(s.connection(), "org-1")
+            set_tenant_context(s.connection(), "org-1", _TEST_KEY_FP_ORG1)
             inv_repo = InvestigationRepository(s)
             inv = inv_repo.create(InvestigationRecord(
                 investigation_id="inv-1", tenant_id="org-1", created_by="user-1",
@@ -228,7 +306,7 @@ class TestFindingRepository:
     def test_add_and_list(self, fresh_db):
         s = _app_session()
         try:
-            set_tenant_context(s.connection(), "org-1")
+            set_tenant_context(s.connection(), "org-1", _TEST_KEY_FP_ORG1)
             inv_repo = InvestigationRepository(s)
             inv = inv_repo.create(InvestigationRecord(
                 investigation_id="inv-1", tenant_id="org-1", created_by="user-1",
@@ -253,7 +331,7 @@ class TestEvidenceRepository:
     def test_add_and_list(self, fresh_db):
         s = _app_session()
         try:
-            set_tenant_context(s.connection(), "org-1")
+            set_tenant_context(s.connection(), "org-1", _TEST_KEY_FP_ORG1)
             inv_repo = InvestigationRepository(s)
             inv = inv_repo.create(InvestigationRecord(
                 investigation_id="inv-1", tenant_id="org-1", created_by="user-1",
@@ -279,7 +357,7 @@ class TestEvidenceRepository:
     def test_integrity_hash_changes_with_content(self, fresh_db):
         s = _app_session()
         try:
-            set_tenant_context(s.connection(), "org-1")
+            set_tenant_context(s.connection(), "org-1", _TEST_KEY_FP_ORG1)
             inv_repo = InvestigationRepository(s)
             inv = inv_repo.create(InvestigationRecord(
                 investigation_id="inv-1", tenant_id="org-1", created_by="user-1",
@@ -312,7 +390,7 @@ class TestReportRepository:
     def test_create_and_update(self, fresh_db):
         s = _app_session()
         try:
-            set_tenant_context(s.connection(), "org-1")
+            set_tenant_context(s.connection(), "org-1", _TEST_KEY_FP_ORG1)
             inv_repo = InvestigationRepository(s)
             inv = inv_repo.create(InvestigationRecord(
                 investigation_id="inv-1", tenant_id="org-1", created_by="user-1",
@@ -344,7 +422,7 @@ class TestAuditEventRepository:
     def test_record_and_list(self, fresh_db):
         s = _app_session()
         try:
-            set_tenant_context(s.connection(), "org-1")
+            set_tenant_context(s.connection(), "org-1", _TEST_KEY_FP_ORG1)
             inv_repo = InvestigationRepository(s)
             inv = inv_repo.create(InvestigationRecord(
                 investigation_id="inv-1", tenant_id="org-1", created_by="user-1",
@@ -369,7 +447,7 @@ class TestAuditEventRepository:
     def test_sanitizes_secrets(self, fresh_db):
         s = _app_session()
         try:
-            set_tenant_context(s.connection(), "org-1")
+            set_tenant_context(s.connection(), "org-1", _TEST_KEY_FP_ORG1)
             inv_repo = InvestigationRepository(s)
             inv = inv_repo.create(InvestigationRecord(
                 investigation_id="inv-1", tenant_id="org-1", created_by="user-1",
@@ -399,7 +477,7 @@ class TestAuditEventRepository:
         """Verify that hash-chain integrity is maintained across multiple events."""
         s = _app_session()
         try:
-            set_tenant_context(s.connection(), "org-1")
+            set_tenant_context(s.connection(), "org-1", _TEST_KEY_FP_ORG1)
             inv_repo = InvestigationRepository(s)
             inv = inv_repo.create(InvestigationRecord(
                 investigation_id="inv-1", tenant_id="org-1", created_by="user-1",
@@ -442,7 +520,7 @@ class TestAuditEventRepository:
         """Verify that modifying a historical event breaks the chain."""
         s = _app_session()
         try:
-            set_tenant_context(s.connection(), "org-1")
+            set_tenant_context(s.connection(), "org-1", _TEST_KEY_FP_ORG1)
             inv_repo = InvestigationRepository(s)
             inv = inv_repo.create(InvestigationRecord(
                 investigation_id="inv-1", tenant_id="org-1", created_by="user-1",
@@ -491,7 +569,7 @@ class TestAuditEventRepository:
         """Verify chain_hash is stored in its own column, not in meta JSON."""
         s = _app_session()
         try:
-            set_tenant_context(s.connection(), "org-1")
+            set_tenant_context(s.connection(), "org-1", _TEST_KEY_FP_ORG1)
             inv_repo = InvestigationRepository(s)
             inv = inv_repo.create(InvestigationRecord(
                 investigation_id="inv-1", tenant_id="org-1", created_by="user-1",
@@ -526,7 +604,7 @@ class TestPersistentStore:
         # Create data with explicit tenant_id (required by RLS policy)
         s = _app_session()
         try:
-            set_tenant_context(s.connection(), "org-1")
+            set_tenant_context(s.connection(), "org-1", _TEST_KEY_FP_ORG1)
             s.add(InvestigationModel(investigation_id="inv-1", tenant_id="org-1", status="QUEUED"))
             s.commit()
         finally:
@@ -535,7 +613,7 @@ class TestPersistentStore:
         # Verify org-1 can see its data
         s = _app_session()
         try:
-            set_tenant_context(s.connection(), "org-1")
+            set_tenant_context(s.connection(), "org-1", _TEST_KEY_FP_ORG1)
             result = s.execute(text("SELECT COUNT(*) FROM investigations")).scalar()
             assert result >= 1
         finally:
@@ -544,7 +622,7 @@ class TestPersistentStore:
     def test_table_counts_after_writes(self, fresh_db):
         s = _app_session()
         try:
-            set_tenant_context(s.connection(), "org-1")
+            set_tenant_context(s.connection(), "org-1", _TEST_KEY_FP_ORG1)
             s.add(InvestigationModel(investigation_id="inv-1", tenant_id="org-1", status="QUEUED"))
             s.commit()
             s.add(AgentRunModel(run_id="run-1", investigation_id="inv-1", agent_type="osint", status="running"))
@@ -561,7 +639,7 @@ class TestUpgradePersistence:
     def test_upgrade_returns_schema_info(self, fresh_db):
         s = _app_session()
         try:
-            set_tenant_context(s.connection(), "org-1")
+            set_tenant_context(s.connection(), "org-1", _TEST_KEY_FP_ORG1)
             tables = s.execute(text("SELECT tablename FROM pg_tables WHERE schemaname='public'")).scalars().all()
             assert "investigations" in tables
             assert "agent_runs" in tables
@@ -578,7 +656,7 @@ class TestTenantIsolation:
         # Create data for org-1
         s1 = _app_session()
         try:
-            set_tenant_context(s1.connection(), "org-1")
+            set_tenant_context(s1.connection(), "org-1", _TEST_KEY_FP_ORG1)
             repo1 = InvestigationRepository(s1)
             for i in range(3):
                 rec = InvestigationRecord(
@@ -593,7 +671,7 @@ class TestTenantIsolation:
         # Create data for org-2
         s2 = _app_session()
         try:
-            set_tenant_context(s2.connection(), "org-2")
+            set_tenant_context(s2.connection(), "org-2", _TEST_KEY_FP_ORG2)
             repo2 = InvestigationRepository(s2)
             rec2 = InvestigationRecord(
                 investigation_id="inv-a", tenant_id="org-2", created_by="user-2",
@@ -607,7 +685,7 @@ class TestTenantIsolation:
         # Verify org-1 sees only its data
         s1 = _app_session()
         try:
-            set_tenant_context(s1.connection(), "org-1")
+            set_tenant_context(s1.connection(), "org-1", _TEST_KEY_FP_ORG1)
             org1 = InvestigationRepository(s1).list_by_tenant(tenant_id="org-1")
             assert len(org1) == 3
         finally:
@@ -616,7 +694,7 @@ class TestTenantIsolation:
         # Verify org-2 sees only its data
         s2 = _app_session()
         try:
-            set_tenant_context(s2.connection(), "org-2")
+            set_tenant_context(s2.connection(), "org-2", _TEST_KEY_FP_ORG2)
             org2 = InvestigationRepository(s2).list_by_tenant(tenant_id="org-2")
             assert len(org2) == 1
         finally:
@@ -624,24 +702,17 @@ class TestTenantIsolation:
 
     def test_rls_blocks_cross_tenant_raw_query(self, fresh_db):
         """Test that RLS blocks cross-tenant access even via raw SQL bypass."""
-        role_name = f"rls_test_{uuid.uuid4().hex[:8]}"
-        role_pass = "rls_test_pass"
-
-        setup_conn = psycopg2.connect(OWNER_URL)
-        setup_conn.autocommit = True
-        setup_cur = setup_conn.cursor()
-        setup_cur.execute(f"CREATE ROLE {role_name} LOGIN PASSWORD %s", (role_pass,))
-        setup_cur.execute(f"GRANT USAGE ON SCHEMA public TO {role_name}")
-        setup_cur.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {role_name}")
-        setup_cur.execute(f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {role_name}")
-        setup_cur.close()
-        setup_conn.close()
+        # Use the application role (has table-level SELECT/INSERT/UPDATE/DELETE)
+        # but RLS policies still block cross-tenant access.
+        role_name = "safenestt_app"
+        role_pass = "safenestt_test_local_only"
+        app_dsn = f"postgresql://{role_name}:{role_pass}@127.0.0.1:55432/safenestt_ai_test"
 
         try:
             # Create data via app session (RLS applies)
             s1 = _app_session()
             try:
-                set_tenant_context(s1.connection(), "tenant-a")
+                set_tenant_context(s1.connection(), "tenant-a", _TEST_KEY_FP_TENANT_A)
                 s1.add(InvestigationModel(
                     investigation_id="inv-a", tenant_id="tenant-a", status="QUEUED",
                     created_at=datetime.now(UTC), updated_at=datetime.now(UTC)
@@ -652,7 +723,7 @@ class TestTenantIsolation:
 
             s2 = _app_session()
             try:
-                set_tenant_context(s2.connection(), "tenant-b")
+                set_tenant_context(s2.connection(), "tenant-b", _TEST_KEY_FP_TENANT_B)
                 s2.add(InvestigationModel(
                     investigation_id="inv-b", tenant_id="tenant-b", status="QUEUED",
                     created_at=datetime.now(UTC), updated_at=datetime.now(UTC)
@@ -661,12 +732,12 @@ class TestTenantIsolation:
             finally:
                 s2.close()
 
-            # Test via separate role (not app role)
-            conn_a = psycopg2.connect(f"postgresql://{role_name}:{role_pass}@172.19.0.11:5432/safenestt_ai")
+            # Test via application role (RLS policies apply)
+            conn_a = psycopg2.connect(app_dsn)
             conn_a.autocommit = False
             cur_a = conn_a.cursor()
             cur_a.execute("BEGIN")
-            cur_a.execute("SET LOCAL app.current_tenant_id = 'tenant-a'")
+            cur_a.execute("SET LOCAL app.current_tenant = 'tenant-a'")
             cur_a.execute("SELECT investigation_id FROM investigations")
             result_a = [r[0] for r in cur_a.fetchall()]
             assert "inv-a" in result_a
@@ -675,11 +746,11 @@ class TestTenantIsolation:
             cur_a.close()
             conn_a.close()
 
-            conn_b = psycopg2.connect(f"postgresql://{role_name}:{role_pass}@172.19.0.11:5432/safenestt_ai")
+            conn_b = psycopg2.connect(app_dsn)
             conn_b.autocommit = False
             cur_b = conn_b.cursor()
             cur_b.execute("BEGIN")
-            cur_b.execute("SET LOCAL app.current_tenant_id = 'tenant-b'")
+            cur_b.execute("SET LOCAL app.current_tenant = 'tenant-b'")
             cur_b.execute("SELECT investigation_id FROM investigations")
             result_b = [r[0] for r in cur_b.fetchall()]
             assert "inv-b" in result_b
@@ -688,7 +759,7 @@ class TestTenantIsolation:
             cur_b.close()
             conn_b.close()
         finally:
-            setup_conn = psycopg2.connect(OWNER_URL)
+            setup_conn = psycopg2.connect(_OWNER_DSN)
             setup_conn.autocommit = True
             setup_cur = setup_conn.cursor()
             try:
@@ -700,24 +771,21 @@ class TestTenantIsolation:
             setup_conn.close()
 
     def test_rls_blocks_child_table_cross_tenant_access(self, fresh_db):
-        role_name = f"rls_test_{uuid.uuid4().hex[:8]}"
-        role_pass = "rls_test_pass"
+        # Use the application role (has table-level privileges and RLS policies)
+        role_name = "safenestt_app"
+        role_pass = "safenestt_app"
+        app_dsn = f"postgresql://{role_name}:{role_pass}@127.0.0.1:55432/safenestt_ai_test"
 
-        setup_conn = psycopg2.connect(OWNER_URL)
-        setup_conn.autocommit = True
-        setup_cur = setup_conn.cursor()
-        setup_cur.execute(f"CREATE ROLE {role_name} LOGIN PASSWORD %s", (role_pass,))
-        setup_cur.execute(f"GRANT USAGE ON SCHEMA public TO {role_name}")
-        setup_cur.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {role_name}")
-        setup_cur.execute(f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {role_name}")
-        setup_cur.close()
-        setup_conn.close()
-
+        # fresh_db (autouse) creates the tenant tables, then applies RLS policies.
+        # The role must be granted table-level privileges *after* the tables exist
+        # (PostgreSQL's GRANT ... ON ALL TABLES is snapshot-based and does not
+        # retroactively apply to tables created after the grant).
         try:
+
             # Create data via app session
             s1 = _app_session()
             try:
-                set_tenant_context(s1.connection(), "tenant-a")
+                set_tenant_context(s1.connection(), "tenant-a", _TEST_KEY_FP_TENANT_A)
                 s1.add(InvestigationModel(
                     investigation_id="inv-a", tenant_id="tenant-a", status="QUEUED",
                     created_at=datetime.now(UTC), updated_at=datetime.now(UTC)
@@ -729,7 +797,7 @@ class TestTenantIsolation:
 
             s2 = _app_session()
             try:
-                set_tenant_context(s2.connection(), "tenant-b")
+                set_tenant_context(s2.connection(), "tenant-b", _TEST_KEY_FP_TENANT_B)
                 s2.add(InvestigationModel(
                     investigation_id="inv-b", tenant_id="tenant-b", status="QUEUED",
                     created_at=datetime.now(UTC), updated_at=datetime.now(UTC)
@@ -739,11 +807,12 @@ class TestTenantIsolation:
             finally:
                 s2.close()
 
-            conn_a = psycopg2.connect(f"postgresql://{role_name}:{role_pass}@172.19.0.11:5432/safenestt_ai")
+            # Test via application role (RLS policies apply)
+            conn_a = psycopg2.connect(app_dsn)
             conn_a.autocommit = False
             cur_a = conn_a.cursor()
             cur_a.execute("BEGIN")
-            cur_a.execute("SET LOCAL app.current_tenant_id = 'tenant-a'")
+            cur_a.execute("SET LOCAL app.current_tenant = 'tenant-a'")
             cur_a.execute("SELECT finding_id FROM findings")
             result_a = [r[0] for r in cur_a.fetchall()]
             assert "find-a" in result_a
@@ -752,11 +821,11 @@ class TestTenantIsolation:
             cur_a.close()
             conn_a.close()
 
-            conn_b = psycopg2.connect(f"postgresql://{role_name}:{role_pass}@172.19.0.11:5432/safenestt_ai")
+            conn_b = psycopg2.connect(app_dsn)
             conn_b.autocommit = False
             cur_b = conn_b.cursor()
             cur_b.execute("BEGIN")
-            cur_b.execute("SET LOCAL app.current_tenant_id = 'tenant-b'")
+            cur_b.execute("SET LOCAL app.current_tenant = 'tenant-b'")
             cur_b.execute("SELECT finding_id FROM findings")
             result_b = [r[0] for r in cur_b.fetchall()]
             assert "find-b" in result_b
@@ -765,7 +834,7 @@ class TestTenantIsolation:
             cur_b.close()
             conn_b.close()
         finally:
-            setup_conn = psycopg2.connect(OWNER_URL)
+            setup_conn = psycopg2.connect(_OWNER_DSN)
             setup_conn.autocommit = True
             setup_cur = setup_conn.cursor()
             try:
@@ -779,7 +848,7 @@ class TestTenantIsolation:
     def test_null_tenant_investigation_hidden(self, fresh_db):
         """Verify that a NULL-tenant investigation is NOT visible to any tenant."""
         # Create NULL-tenant investigation via owner (bypasses RLS)
-        setup_conn = psycopg2.connect(OWNER_URL)
+        setup_conn = psycopg2.connect(_OWNER_DSN)
         setup_conn.autocommit = True
         setup_cur = setup_conn.cursor()
         setup_cur.execute("INSERT INTO investigations (investigation_id, tenant_id, status, created_at, updated_at) VALUES ('inv-null', NULL, 'QUEUED', NOW(), NOW())")
@@ -790,7 +859,7 @@ class TestTenantIsolation:
             # App session should NOT see NULL-tenant investigation
             s = _app_session()
             try:
-                set_tenant_context(s.connection(), "some-tenant")
+                set_tenant_context(s.connection(), "some-tenant", _TEST_KEY_FP_SOME_TENANT)
                 result = s.execute(text("SELECT investigation_id FROM investigations")).scalars().all()
                 assert "inv-null" not in result, f"FAIL: NULL-tenant visible to some-tenant: {result}"
             finally:
@@ -799,15 +868,35 @@ class TestTenantIsolation:
             # Another tenant also should NOT see it
             s2 = _app_session()
             try:
-                set_tenant_context(s2.connection(), "another-tenant")
+                set_tenant_context(s2.connection(), "another-tenant", _TEST_KEY_FP_ANOTHER_TENANT)
                 result = s2.execute(text("SELECT investigation_id FROM investigations")).scalars().all()
                 assert "inv-null" not in result, f"FAIL: NULL-tenant visible to another-tenant: {result}"
             finally:
                 s2.close()
         finally:
-            setup_conn = psycopg2.connect(OWNER_URL)
+            setup_conn = psycopg2.connect(_OWNER_DSN)
             setup_conn.autocommit = True
             setup_cur = setup_conn.cursor()
             setup_cur.execute("DELETE FROM investigations WHERE investigation_id = 'inv-null'")
             setup_cur.close()
             setup_conn.close()
+
+
+class TestTenantContextRegression:
+    def test_missing_required_tenant_context_raises(self, fresh_db):
+        """Regression: set_tenant_context() must raise when tenant context is missing."""
+        from safenestt.persistence.rls import set_tenant_context
+        from safenestt.persistence.engine import create_engine
+        create_engine()
+        from sqlalchemy.orm import sessionmaker
+        Session = sessionmaker()
+        session = Session()
+        try:
+            # No tenant context established -- set_tenant_context must reject it.
+            try:
+                set_tenant_context(session.connection(), "org-1")
+                assert False, "set_tenant_context() should require a valid key_fingerprint"
+            except Exception:
+                pass
+        finally:
+            session.close()

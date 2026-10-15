@@ -169,26 +169,46 @@ def build_case_evidence_item_data(
 
 @dataclass
 class GraphNodeRecord:
-    """A single Base44 GraphNode built from Hermes data."""
+    """A single investigation graph node.
+
+    Produced by build_graph_from_findings() from Hermes FindingRecord + EvidenceRecord.
+    Persisted to graph_nodes table via store.add_graph_node().
+    This is the authoritative SENTRA graph; Base44 GraphNode entities are a
+    derived presentation copy rebuilt from Hermes results.
+    """
 
     id: str
+    investigation_id: str
     case_id: str
+    node_key: str  # Stable identifier within investigation (equals id for FK resolution)
     node_type: str  # "entity" | "evidence" | "finding"
     label: str
     node_data: dict[str, Any] = field(default_factory=dict)
+    source: str = "hermes"
+    provenance: str = ""
 
 
 @dataclass
 class GraphEdgeRecord:
-    """A single Base44 GraphEdge built from Hermes data."""
+    """A single investigation graph edge.
+
+    Connects two GraphNodeRecords within the same investigation.
+    Persisted to graph_edges table via store.add_graph_edge().
+    The same-investigation constraint is enforced by store.add_graph_edge()
+    which verifies both nodes belong to the same investigation.
+    """
 
     id: str
+    investigation_id: str
     case_id: str
+    edge_key: str  # Stable identifier within investigation (equals id for uniqueness)
     source_node_id: str
     target_node_id: str
     edge_type: str  # "about" | "supports" | "supported_by"
     edge_label: str
     edge_data: dict[str, Any] = field(default_factory=dict)
+    source: str = "hermes"
+    provenance: str = ""
 
 
 def build_graph_from_findings(
@@ -228,7 +248,9 @@ def build_graph_from_findings(
 
         nodes.append(GraphNodeRecord(
             id=finding_node_id,
+            investigation_id=hermes_investigation_id,
             case_id=case_id,
+            node_key=finding_node_id,
             node_type="finding",
             label=finding_label,
             node_data={
@@ -254,7 +276,9 @@ def build_graph_from_findings(
             ev_node_id = f"gn-ev-{hermes_investigation_id}-{ev_id[:12]}"
             nodes.append(GraphNodeRecord(
                 id=ev_node_id,
+                investigation_id=hermes_investigation_id,
                 case_id=case_id,
+                node_key=ev_node_id,
                 node_type="evidence",
                 label=ev.source[:200],
                 node_data={
@@ -276,7 +300,9 @@ def build_graph_from_findings(
             entity_node_id = f"gn-enty-{hermes_investigation_id}-{target_str[:12]}"
             nodes.append(GraphNodeRecord(
                 id=entity_node_id,
+                investigation_id=hermes_investigation_id,
                 case_id=case_id,
+                node_key=entity_node_id,
                 node_type="entity",
                 label=target_str[:200],
                 node_data={
@@ -303,7 +329,9 @@ def build_graph_from_findings(
             ev_node_id = f"gn-ev-{hermes_investigation_id}-{ev_id[:12]}"
             edges.append(GraphEdgeRecord(
                 id=f"ge-fe-{hermes_investigation_id}-{ev_id[:12]}",
+                investigation_id=hermes_investigation_id,
                 case_id=case_id,
+                edge_key=f"ge-fe-{hermes_investigation_id}-{ev_id[:12]}",
                 source_node_id=finding_node_id,
                 target_node_id=ev_node_id,
                 edge_type="supported_by",
@@ -321,7 +349,9 @@ def build_graph_from_findings(
             entity_node_id = f"gn-enty-{hermes_investigation_id}-{target_str[:12]}"
             edges.append(GraphEdgeRecord(
                 id=f"ge-fent-{hermes_investigation_id}-{target_str[:12]}",
+                investigation_id=hermes_investigation_id,
                 case_id=case_id,
+                edge_key=f"ge-fent-{hermes_investigation_id}-{target_str[:12]}",
                 source_node_id=finding_node_id,
                 target_node_id=entity_node_id,
                 edge_type="about",
@@ -341,7 +371,9 @@ def build_graph_from_findings(
                 entity_node_id = f"gn-enty-{hermes_investigation_id}-{target_str[:12]}"
                 edges.append(GraphEdgeRecord(
                     id=f"ge-eent-{hermes_investigation_id}-{target_str[:12]}-{ev_id[:8]}",
+                    investigation_id=hermes_investigation_id,
                     case_id=case_id,
+                    edge_key=f"ge-eent-{hermes_investigation_id}-{target_str[:12]}-{ev_id[:8]}",
                     source_node_id=ev_node_id,
                     target_node_id=entity_node_id,
                     edge_type="supports",

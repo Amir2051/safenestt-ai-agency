@@ -16,21 +16,14 @@ except ImportError:
 
 class OsintAgent(BaseAgent):
     role = "osint"
-    allowed_tools = [
-        "cyber_intel.osint_profile.email",
-        "cyber_intel.osint_profile.domain",
-        "cyber_intel.osint_profile.ip",
-        "cyber_intel.osint_profile.username",
-        "cyber_intel.osint_profile.phone",
-        "cyber_intel.reputation_score.email",
-        "cyber_intel.reputation_score.phone",
-    ]
 
     def __init__(self, agent, permission_manager=None):
         super().__init__(agent, permission_manager)
         self.adapter = CyberIntelOSINTAdapter()
+        self._run_suffix = ""
 
     def execute(self, run: AgentRun, inputs: dict[str, Any]) -> AgentRun:
+        self._run_suffix = f"-{run.run_id}"
         run = self.run(run, inputs)
         indicators = inputs.get("indicators") or {}
         findings: list[Finding] = []
@@ -121,13 +114,20 @@ class OsintAgent(BaseAgent):
     def _sanitize_tool_call(capability: str, result: dict[str, Any]) -> dict[str, Any]:
         safe = dict(result)
         safe.pop("metadata", None)
-        # Also pop internal keys added by fallback logic
-        safe.pop("source", None)
+        # Adapter returns flat structure; top-level keys ARE the result data
+        result_status = safe.get("status")
+        allowed = result_status == "success"
         return {
             "capability": capability,
-            "status": safe.get("decision") or safe.get("result", {}).get("status"),
-            "tool_status": (safe.get("result") or {}).get("status"),
-            "source": (safe.get("result") or {}).get("source"),
+            "status": safe.get("status"),
+            "tool_status": "ALLOW" if allowed else result_status,
+            "source": safe.get("source"),
+            "result": {
+                "source": safe.get("source"),
+                "data": safe.get("data", {}),
+                "confidence": safe.get("confidence", 0.65 if allowed else 0.0),
+                "target": safe.get("target") or safe.get("query") or "",
+            },
         }
 
     def _to_finding(self, run: AgentRun, capability: str, result: dict[str, Any]) -> Finding | None:

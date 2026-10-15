@@ -164,7 +164,16 @@ class PermissionManager:
             approval_required=requires_approval,
             approval_id=approval_id,
         )
-        self._emit(AuditEvent(event_id="auth-allow", actor_type="agent", actor_id=agent_id, action=capability, decision="ALLOW", risk_level=risk, detail="authorized", metadata={"required_permission": required_permission, "approval_required": requires_approval}))
+        self._emit(AuditEvent(
+            event_id=f"auth-allow-{agent_id}-{capability}",
+            actor_type="agent",
+            actor_id=agent_id,
+            action=capability,
+            decision="ALLOW",
+            risk_level=risk,
+            detail="authorized",
+            metadata={"required_permission": required_permission, "approval_required": requires_approval},
+        ))
         return decision
 
     def evaluate_execution(self, agent: AgentRecord | None, capability: str, payload: dict[str, Any]) -> AuthorizationDecision:

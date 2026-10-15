@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 import json
 import logging
 from datetime import datetime, UTC
 from typing import Any
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy import select, update
 
 from safenestt.persistence.engine import session_scope
@@ -291,13 +293,24 @@ class AuditEventRepository:
         if inv_id is None and hasattr(event, "metadata") and event.metadata:
             inv_id = event.metadata.get("investigation_id")
 
+        # event_id must be unique per ROW. Callers generate deterministic ids
+        # ("auth-deny", f"rate-deny-{key}", f"auth-deny-{agent}-{capability}", ...),
+        # so any repeated event -- two auth denials for one capability, a retried
+        # investigation -- collides on ix_audit_events_event_id. Disambiguate only
+        # on collision so the first occurrence keeps its stable, queryable id.
+        event_id = event.event_id
+        if self._session.execute(
+            select(AuditEventModel.id).where(AuditEventModel.event_id == event_id).limit(1)
+        ).scalar_one_or_none() is not None:
+            event_id = f"{event_id}-{uuid.uuid4().hex[:8]}"
+
         # Build hash chain
         previous_hash = self._get_previous_hash()
-        event_data = f"{event.event_id}:{event.actor_type}:{event.actor_id}:{event.action}:{event.decision}"
+        event_data = f"{event_id}:{event.actor_type}:{event.actor_id}:{event.action}:{event.decision}"
         chain_hash = self._compute_hash(previous_hash, event_data)
 
         model = AuditEventModel(
-            event_id=event.event_id,
+            event_id=event_id,
             investigation_id=inv_id,
             actor_type=event.actor_type,
             actor_id=event.actor_id,
@@ -311,8 +324,37 @@ class AuditEventRepository:
             chain_hash=chain_hash,
         )
 
-        self._session.add(model)
-        self._session.flush()
+        # The audit event is its own atomic unit: commit it here so a failed or
+        # abandoned write can never leave this session idle-in-transaction holding
+        # RowExclusiveLock on audit_events_id_seq. That lock blocks every later
+        # audit INSERT, and because an investigation writes audit events early in
+        # the pipeline, one leaked transaction wedges the whole engine -- every
+        # investigation stalls with zero evidence, findings and agent runs.
+        # flush() alone opens a transaction that nothing closed; commit/rollback
+        # in a finally-equivalent pair closes it on both paths.
+        # A probe-then-insert is NOT atomic: two writers can both see the id as
+        # free and race. So the uniqueness check above is only a fast path; the
+        # authoritative guard is retry-on-IntegrityError, which closes the race
+        # and still leaves the stable id in place whenever nothing collides.
+        for attempt in range(2):
+            try:
+                self._session.add(model)
+                self._session.flush()
+                self._session.commit()
+                return event
+            except IntegrityError:
+                self._session.rollback()
+                if attempt:            # second failure -> surface it, never hide it
+                    raise
+                # Genuine collision: give this event its own id and retry once.
+                model.event_id = f"{model.event_id}-{uuid.uuid4().hex[:8]}"
+                event_id = model.event_id
+                model.chain_hash = self._compute_hash(
+                    self._get_previous_hash(),
+                    f"{event_id}:{event.actor_type}:{event.actor_id}:{event.action}:{event.decision}")
+            except Exception:
+                self._session.rollback()
+                raise
         return event
 
     def list_all(self, limit: int = 1000) -> list[AuditEventModel]:

@@ -36,10 +36,40 @@ SHOW ssl;
 -- DEFAULT PRIVILEGES FOR FUTURE TABLES
 -- ============================================================
 -- Grant appropriate access on future tables
+-- ALIGNED WITH migrate.py (migration 004).
+--
+-- This path used to grant SELECT/INSERT/UPDATE/DELETE on every FUTURE table,
+-- which silently re-granted write access to security-sensitive tables such as
+-- public._tenant_context the moment they were created. Tenant identity in that
+-- table must only ever be written by the SECURITY DEFINER
+-- establish_tenant_context(), which re-verifies the API-key fingerprint in
+-- SQL. Direct write access let any SQL caller running as the application role
+-- forge a tenant context with no API key at all (confirmed bypass).
+--
+-- Default privileges are therefore restricted to SELECT, and an explicit,
+-- deterministic revoke re-asserts the _tenant_context restriction after any
+-- blanket grant. Both statements are idempotent.
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
-    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO safenestt_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public
-    GRANT USAGE, SELECT ON SEQUENCES TO safenestt_app;
+    GRANT SELECT ON TABLES TO safenestt_app;
+GRANT USAGE, SELECT ON SEQUENCES TO safenestt_app;
+
+-- Deterministic override: no future table inherits write access from the
+-- defaults above, and _tenant_context stays protected even if it exists.
+DO $$
+DECLARE _r record;
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_class c
+        WHERE c.relname = '_tenant_context'
+          AND c.relnamespace = 'public'::regnamespace
+    ) THEN
+        EXECUTE 'REVOKE INSERT, UPDATE, DELETE ON public._tenant_context FROM safenestt_app';
+        EXECUTE 'REVOKE ALL ON public._tenant_context FROM PUBLIC';
+        FOR _r IN SELECT rolname FROM pg_roles WHERE rolname LIKE 'rls\_test\_%' LOOP
+            EXECUTE format('REVOKE ALL ON public._tenant_context FROM %I', _r.rolname);
+        END LOOP;
+    END IF;
+END $$;
 """
 
 

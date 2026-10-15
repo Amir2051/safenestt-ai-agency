@@ -168,11 +168,13 @@ class ApprovalService:
         return self.repository.create(record)
 
     def record_decision(self, approval_id: str, approved: bool, *, organization_id: str | None = None, approver_identity: str | None = None, metadata: dict[str, Any] | None = None) -> ApprovalRecord | None:
+        """Record an approval decision. Delegates to repository approve/reject."""
         if approved:
             return self.repository.approve(approval_id, approver_identity=approver_identity, metadata=metadata, organization_id=organization_id)
         return self.repository.reject(approval_id, approver_identity=approver_identity, metadata=metadata, organization_id=organization_id)
 
     def is_approved(self, approval_id: str, *, organization_id: str | None = None) -> bool:
+        """Check whether an approval request has been approved and not expired."""
         record = self.repository.get(approval_id, organization_id=organization_id)
         if not record:
             return False

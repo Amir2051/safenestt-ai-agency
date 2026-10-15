@@ -1,7 +1,25 @@
 [Unit]
 Description=SafeNestT AI Investigation Engine
-After=network.target
-Wants=network.target
+Documentation=file:///home/ronzoro/safenestt-ai/README.md
+# FIX (2026-10-04): this unit previously declared only `After=network.target`.
+# At every boot the engine lost a start race against the PostgreSQL container
+# and burned 4 restarts (~35s of downtime) before succeeding — visible in
+# `journalctl -u safenestt-engine.service` for boot 0ea43cfbe34e4. It now
+# orders against docker + network-online, and the bounded poll in ExecStartPre
+# below is what actually closes the race (a started container is not yet a
+# container accepting connections).
+After=network-online.target docker.service
+Wants=network-online.target
+
+# Restart-loop budget.
+# These MUST live in [Unit], not [Service]: systemd silently ignores
+# StartLimitIntervalSec/StartLimitBurst there. That was the bug — the
+# directives were previously in [Service] and had NO effect, so the
+# default limit (5 failures / 10s) applied. A transient database
+# outage at boot could exhaust that budget and leave the service
+# DOWN indefinitely.
+StartLimitIntervalSec=300
+StartLimitBurst=20
 
 [Service]
 Type=simple
@@ -18,17 +36,93 @@ Environment=DB_PORT=54322
 Environment=DB_NAME=safenestt_ai
 Environment=DB_USER=safenestt_app
 Environment=DB_SSL_MODE=disable
-Environment=MODEL_PROVIDER=ollama
-Environment=OLLAMA_BASE_URL=http://localhost:11434
-Environment=MODEL_NAME=qwen3:1.7b
+# ---------------------------------------------------------------------
+# MODEL PROVIDER — CHANGED 2026-10-04
+#
+# Was: MODEL_PROVIDER=ollama + qwen3:1.7b. On CPU that model needs 60s+ per
+# call, which is why runs appeared to hang. Now: OpenRouter
+# nvidia/nemotron-3.5-lightning:free, verified live on 2026-10-04
+# (OpenRouterProvider.generate() returned error=None).
+#
+# The API key itself lives ONLY in /etc/safenestt/engine.env (see below). It is
+# never written into this unit or into the git-tracked repo.
+# ---------------------------------------------------------------------
+Environment=MODEL_PROVIDER=openrouter
+Environment=OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+Environment=OPENROUTER_MODEL=nvidia/nemotron-3.5-lightning:free
+Environment=MODEL_NAME=nvidia/nemotron-3.5-lightning:free
 Environment=ENCRYPTION_AT_REST=true
 Environment=DB_QUERY_LOG=false
-Environment=API_KEY_PEPPER=safenestt-pepper-change-in-production
 
-# These MUST be set via secret manager in production:
-# Environment=DB_PASSWORD=...
-# Environment=HERMES_API_KEY=...
-# Environment=SAFENESTT_ENCRYPTION_KEY=...
+# ---------------------------------------------------------------------
+# SECRET SOURCE
+#
+# Secrets are supplied by an EnvironmentFile OUTSIDE the repository:
+#
+#     /etc/safenestt/engine.env      (root:safenestt, 0640)
+#
+# It holds ONLY the application role's own credentials. NO owner /
+# privileged credentials appear here or in this unit: enabling RLS
+# requires table ownership, so the privileged migration step is run
+# separately as a one-shot, never as part of this service.
+#
+# The file contains variable NAMES only until an operator populates it:
+#   DB_USER DB_PASSWORD DB_HOST DB_PORT DB_NAME
+#   SAFENESTT_ENCRYPTION_KEY HERMES_API_KEY API_KEY_PEPPER
+#   OPENROUTER_API_KEY
+#
+# API_KEY_PEPPER was previously hardcoded in this unit. It is a secret (it
+# peppers API-key hashing) and this file is git-tracked, so it was removed.
+# It MUST be populated with the SAME value the database already uses,
+# otherwise existing API keys stop validating.
+#
+# EnvironmentFile is applied AFTER Environment=, so values in this file
+# take precedence over the non-secret defaults declared below.
+#
+# If the file is absent or a variable is missing, the pre-start gate
+# fails and this service does not start — the engine never runs with
+# incomplete credentials.
+# ---------------------------------------------------------------------
+EnvironmentFile=/etc/safenestt/engine.env
+#
+# OWNER CREDENTIALS ARE INTENTIONALLY ABSENT.
+# Enabling RLS requires table ownership, which this least-privilege service
+# does not have, so the privileged migration step cannot run here. Run it as a
+# separate one-shot unit or job before starting this service:
+#
+#   SAFENESTT_OWNER_DATABASE_URL=... python -m safenestt.persistence.startup_gate --migrate
+#
+# Putting owner credentials in this unit would place them in the long-running
+# API process environment, which is exactly what must not happen.
+
+# ---------------------------------------------------------------------
+# WAIT FOR POSTGRESQL
+#
+# Ordered dependencies alone do not close the race: Docker reports a container
+# as started before PostgreSQL accepts connections. This bounded poll is what
+# actually eliminated the boot failures. It is deliberately separate from the
+# security gate below — one waits for the database to exist, the other
+# verifies the database's RLS state.
+# ---------------------------------------------------------------------
+ExecStartPre=/home/ronzoro/safenestt-ai/scripts/wait-for-postgres.sh 127.0.0.1 54322 60
+
+# ---------------------------------------------------------------------
+# PRE-START SECURITY GATE
+#
+# Runs BEFORE uvicorn is started, in the same least-privilege environment the
+# API will use. ExecStartPre (not ExecStartPost) is deliberate: ExecStartPost
+# runs AFTER the process has started and opened its socket, which would leave
+# a window where the application is live but its database security state is
+# unverified.
+#
+# This is the SAME gate used by start-engine.sh and the Docker Compose API
+# service (safenestt/persistence/startup_gate.py). One implementation only.
+#
+# If the gate fails it exits non-zero and systemd refuses to start the
+# service — the engine does not run in a degraded state.
+# ---------------------------------------------------------------------
+ExecStartPre=/home/ronzoro/safenestt-platform/apps/api/.venv/bin/python3 \
+    -m safenestt.persistence.startup_gate --verify
 
 ExecStart=/home/ronzoro/safenestt-platform/apps/api/.venv/bin/python3 \
     -m uvicorn safenestt.api.app:app \
@@ -38,8 +132,17 @@ ExecStart=/home/ronzoro/safenestt-platform/apps/api/.venv/bin/python3 \
     --log-level info \
     --proxy-headers
 
-Restart=on-failure
+# FIX (2026-10-04): this was `Restart=on-failure`. Combined with systemd's
+# default start limit (5 failures / 10s), the four boot failures consumed the
+# entire budget, so the engine could stay DOWN indefinitely until someone
+# intervened. `always` plus an explicit, larger burst restarts it after a
+# transient database outage while still halting a genuine crash loop.
+Restart=always
 RestartSec=5
+
+# Graceful shutdown — let in-flight requests commit before SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=60
 
 # Logging
 StandardOutput=append:/var/log/safenestt/engine.log
