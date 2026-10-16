@@ -261,10 +261,19 @@ BEGIN
         RAISE EXCEPTION 'Invalid API key or tenant mismatch';
     END IF;
 
-    -- Set session-scoped GUC (false = not transaction-local) so tenant
-    -- context survives cross-connection checks and is visible to RLS
-    -- policies after the transaction commits.
-    PERFORM set_config('app.current_tenant', v_tenant_id, false);
+    -- SECURITY (CodeRabbit PR#3, CWE-639): tenant identity is bound to this
+    -- backend PID in public._tenant_context, written ONLY by this SECURITY
+    -- DEFINER function after the API-key fingerprint is verified. The previous
+    -- revision wrote a caller-settable GUC (app.current_tenant); any session
+    -- could overwrite it with SET/set_config to impersonate any tenant and
+    -- bypass every RLS policy. No GUC is used anymore. Mirrors migration 003.
+    INSERT INTO public._tenant_context (backend_pid, tenant_id, key_fingerprint, expires_at)
+    VALUES (pg_backend_pid(), v_tenant_id, p_key_fingerprint, NOW() + INTERVAL '1 hour')
+    ON CONFLICT (backend_pid) DO UPDATE SET
+        tenant_id = EXCLUDED.tenant_id,
+        key_fingerprint = EXCLUDED.key_fingerprint,
+        established_at = NOW(),
+        expires_at = NOW() + INTERVAL '1 hour';
 
     RETURN v_tenant_id;
 END;
@@ -370,8 +379,20 @@ END $$;
 -- No valid context returns '', which matches no row, so policies fail closed.
 CREATE OR REPLACE FUNCTION get_current_tenant()
 RETURNS TEXT AS $sfn$
+DECLARE
+    v_tenant_id TEXT;
 BEGIN
-    RETURN current_setting('app.current_tenant', true);
+    -- SECURITY (CodeRabbit PR#3, CWE-639): tenant identity comes ONLY from the
+    -- PID-bound, fingerprint-verified public._tenant_context. There is NO
+    -- caller-controlled fallback -- the previous current_setting('app.current_tenant')
+    -- let any session spoof the tenant with SET and bypass every RLS policy.
+    -- No valid, unexpired context returns '', which matches no row, so policies
+    -- fail closed. Mirrors migration 003.
+    SELECT tc.tenant_id INTO v_tenant_id
+    FROM public._tenant_context tc
+    WHERE tc.backend_pid = pg_backend_pid()
+      AND tc.expires_at > NOW();
+    RETURN COALESCE(v_tenant_id, '');
 END;
 $sfn$ LANGUAGE plpgsql SECURITY DEFINER STABLE
 SET search_path = pg_catalog, public;

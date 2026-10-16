@@ -94,27 +94,38 @@ def test_cross_tenant_write_blocked(_test_tenant_data):
         assert "row-level security" in str(exc_info.value).lower()
 
 
-def test_guc_overrides_established_pid_context(_test_tenant_data):
-    """Direct GUC override supersedes the established PID-bound context.
-        
-    NOTE: This is expected behavior, not a security bypass. The tenant GUC
-    (app.current_tenant) is session-scoped, so a direct SET/CONFIG override
-    takes precedence over the earlier PID-bound context. The genuine no-context
-    spoofing case (where the GUC fallback was reachable and DID grant tenant
-    identity) is covered by test_rls_tenant_isolation.py::test_guc_spoofing_has_no_effect.
-    Direct forgery of the context TABLE is covered by test_direct_context_write_blocked.
+def test_guc_override_cannot_supersede_established_context(_test_tenant_data):
+    """A GUC override must NOT change tenant identity (CodeRabbit PR#3, CWE-639).
+
+    Tenant identity now comes ONLY from the PID-bound public._tenant_context
+    written by establish_tenant_context(). The app.current_tenant GUC is no
+    longer read by get_current_tenant(), so setting it after a legitimate
+    context is established grants nothing: the established tenant stays
+    authoritative and the other tenant's rows stay invisible. On the previous
+    (vulnerable) revision this test's beta row WAS visible -- that was the bypass.
     """
     with session_scope(tenant_id="tenant-alpha", key_fingerprint=_test_tenant_data["alpha"]["fp"]) as session:
+        # Attacker forges the GUC the old code trusted.
         session.execute(text("SET app.current_tenant = 'tenant-beta'"))
         session.execute(text("SELECT set_config('app.current_tenant', 'tenant-beta', FALSE)"))
-            
-        result = session.execute(text("""
-            SELECT investigation_id FROM investigations 
+
+        # get_current_tenant() ignores the GUC and still resolves tenant-alpha.
+        who = session.execute(text("SELECT get_current_tenant()")).scalar()
+        assert who == "tenant-alpha", f"GUC override changed identity to {who!r}"
+
+        # beta's row must NOT be readable via the forged GUC.
+        beta = session.execute(text("""
+            SELECT investigation_id FROM investigations
             WHERE investigation_id = :inv_id
         """), {"inv_id": _test_tenant_data["beta"]["inv_id"]}).fetchone()
-            
-        # GUC override works (session-scoped), so beta rows are visible
-        assert result is not None
+        assert beta is None, "GUC override leaked another tenant's row"
+
+        # alpha's own row stays visible (established context authoritative).
+        alpha = session.execute(text("""
+            SELECT investigation_id FROM investigations
+            WHERE investigation_id = :inv_id
+        """), {"inv_id": _test_tenant_data["alpha"]["inv_id"]}).fetchone()
+        assert alpha is not None
 
 
 def test_disable_rls_blocked(_test_tenant_data):
