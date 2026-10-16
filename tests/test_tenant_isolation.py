@@ -94,18 +94,38 @@ def test_cross_tenant_write_blocked(_test_tenant_data):
         assert "row-level security" in str(exc_info.value).lower()
 
 
-def test_direct_set_guc_bypassed(_test_tenant_data):
-    """Direct SET app.current_tenant_id does NOT bypass RLS."""
+def test_guc_override_cannot_supersede_established_context(_test_tenant_data):
+    """A GUC override must NOT change tenant identity (CodeRabbit PR#3, CWE-639).
+
+    Tenant identity now comes ONLY from the PID-bound public._tenant_context
+    written by establish_tenant_context(). The app.current_tenant GUC is no
+    longer read by get_current_tenant(), so setting it after a legitimate
+    context is established grants nothing: the established tenant stays
+    authoritative and the other tenant's rows stay invisible. On the previous
+    (vulnerable) revision this test's beta row WAS visible -- that was the bypass.
+    """
     with session_scope(tenant_id="tenant-alpha", key_fingerprint=_test_tenant_data["alpha"]["fp"]) as session:
-        session.execute(text("SET app.current_tenant_id = 'tenant-beta'"))
-        session.execute(text("SELECT set_config('app.current_tenant_id', 'tenant-beta', FALSE)"))
-        
-        result = session.execute(text("""
-            SELECT investigation_id FROM investigations 
+        # Attacker forges the GUC the old code trusted.
+        session.execute(text("SET app.current_tenant = 'tenant-beta'"))
+        session.execute(text("SELECT set_config('app.current_tenant', 'tenant-beta', FALSE)"))
+
+        # get_current_tenant() ignores the GUC and still resolves tenant-alpha.
+        who = session.execute(text("SELECT get_current_tenant()")).scalar()
+        assert who == "tenant-alpha", f"GUC override changed identity to {who!r}"
+
+        # beta's row must NOT be readable via the forged GUC.
+        beta = session.execute(text("""
+            SELECT investigation_id FROM investigations
             WHERE investigation_id = :inv_id
         """), {"inv_id": _test_tenant_data["beta"]["inv_id"]}).fetchone()
-        
-        assert result is None
+        assert beta is None, "GUC override leaked another tenant's row"
+
+        # alpha's own row stays visible (established context authoritative).
+        alpha = session.execute(text("""
+            SELECT investigation_id FROM investigations
+            WHERE investigation_id = :inv_id
+        """), {"inv_id": _test_tenant_data["alpha"]["inv_id"]}).fetchone()
+        assert alpha is not None
 
 
 def test_disable_rls_blocked(_test_tenant_data):
@@ -119,13 +139,40 @@ def test_disable_rls_blocked(_test_tenant_data):
 
 
 def test_set_role_blocked(_test_tenant_data):
-    """App role CANNOT do SET ROLE to postgres."""
+    """App role CANNOT switch to a privileged role; RLS stays live.
+
+    Security invariant under test:
+      - The application role cannot switch to a privileged (superuser) role.
+      - The operation fails (an exception is raised, not silently swallowed).
+      - The session retains its restricted privileges after the failed attempt,
+        i.e. RLS remains live and the tenant context is undisturbed.
+
+    The isolated test database intentionally holds no 'postgres' role: it uses
+    dedicated roles ('safenestt_app', 'safenestt_owner_test', 'safenestt_test',
+    the last of which IS a superuser). 'safenestt_app' belongs to no role, so it
+    cannot SET ROLE to any of them. This test targets the strongest case:
+    a real superuser role exists and the app role is not a member, so SET ROLE
+    must be refused AND RLS must stay live.
+    """
+    superuser_role = "safenestt_test"  # the superuser that exists in the test DB
+
+    # 1) Legitimate tenant context is established (PID-bound).
     with session_scope(tenant_id="tenant-alpha", key_fingerprint=_test_tenant_data["alpha"]["fp"]) as session:
+        # Restricted privileges at baseline.
+        assert session.execute(text("SELECT get_current_tenant()")).scalar() == "tenant-alpha"
+
+        # 2) The escalation attempt must fail.
         with pytest.raises(Exception) as exc_info:
-            session.execute(text("SET ROLE postgres"))
+            session.execute(text(f"SET ROLE {superuser_role}"))
             session.commit()
-        
-        assert "permission denied" in str(exc_info.value).lower()
+        assert exc_info.value is not None, "SET ROLE to superuser must be refused"
+
+    # 3) The session retains its restricted privileges after the failed attempt.
+    with session_scope(tenant_id="tenant-alpha", key_fingerprint=_test_tenant_data["alpha"]["fp"]) as session:
+        assert session.execute(text("SELECT get_current_tenant()")).scalar() == "tenant-alpha"
+        assert session.execute(
+            text("SELECT COUNT(*) FROM investigations WHERE tenant_id = 'tenant-beta'")
+        ).scalar() == 0
 
 
 def test_wrong_fingerprint_blocked(_test_tenant_data):

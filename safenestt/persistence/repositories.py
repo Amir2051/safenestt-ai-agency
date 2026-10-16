@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 import json
 import logging
 from datetime import datetime, UTC
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy import select, text, update
+
+from safenestt.persistence.engine import session_scope
 from sqlalchemy.orm import Session
 
 from safenestt.persistence.models import (
@@ -16,6 +20,7 @@ from safenestt.persistence.models import (
     FindingModel,
     InvestigationModel,
     ReportModel,
+    ApprovalModel,
 )
 from safenestt.security.encryption import encrypt_value, decrypt_value
 
@@ -288,14 +293,38 @@ class AuditEventRepository:
         if inv_id is None and hasattr(event, "metadata") and event.metadata:
             inv_id = event.metadata.get("investigation_id")
 
+        # Get tenant_id from the current tenant context (DB GUC: current_setting('app.current_tenant'))
+        tenant_id = self._session.execute(
+            text("SELECT get_current_tenant()")
+        ).scalar()
+        if tenant_id is None:
+            raise RuntimeError(
+                "audit_events.insert: tenant_id is NULL — "
+                "current_setting('app.current_tenant') returned NULL. "
+                "Init the tenant context before logging audit events."
+            )
+
+
+        # event_id must be unique per ROW. Callers generate deterministic ids
+        # ("auth-deny", f"rate-deny-{key}", f"auth-deny-{agent}-{capability}", ...),
+        # so any repeated event -- two auth denials for one capability, a retried
+        # investigation -- collides on ix_audit_events_event_id. Disambiguate only
+        # on collision so the first occurrence keeps its stable, queryable id.
+        event_id = event.event_id
+        if self._session.execute(
+            select(AuditEventModel.id).where(AuditEventModel.event_id == event_id).limit(1)
+        ).scalar_one_or_none() is not None:
+            event_id = f"{event_id}-{uuid.uuid4().hex[:8]}"
+
         # Build hash chain
         previous_hash = self._get_previous_hash()
-        event_data = f"{event.event_id}:{event.actor_type}:{event.actor_id}:{event.action}:{event.decision}"
+        event_data = f"{event_id}:{event.actor_type}:{event.actor_id}:{event.action}:{event.decision}"
         chain_hash = self._compute_hash(previous_hash, event_data)
 
         model = AuditEventModel(
-            event_id=event.event_id,
+            event_id=event_id,
             investigation_id=inv_id,
+            tenant_id=tenant_id,
             actor_type=event.actor_type,
             actor_id=event.actor_id,
             action=event.action,
@@ -308,8 +337,37 @@ class AuditEventRepository:
             chain_hash=chain_hash,
         )
 
-        self._session.add(model)
-        self._session.flush()
+        # The audit event is its own atomic unit: commit it here so a failed or
+        # abandoned write can never leave this session idle-in-transaction holding
+        # RowExclusiveLock on audit_events_id_seq. That lock blocks every later
+        # audit INSERT, and because an investigation writes audit events early in
+        # the pipeline, one leaked transaction wedges the whole engine -- every
+        # investigation stalls with zero evidence, findings and agent runs.
+        # flush() alone opens a transaction that nothing closed; commit/rollback
+        # in a finally-equivalent pair closes it on both paths.
+        # A probe-then-insert is NOT atomic: two writers can both see the id as
+        # free and race. So the uniqueness check above is only a fast path; the
+        # authoritative guard is retry-on-IntegrityError, which closes the race
+        # and still leaves the stable id in place whenever nothing collides.
+        for attempt in range(2):
+            try:
+                self._session.add(model)
+                self._session.flush()
+                self._session.commit()
+                return event
+            except IntegrityError:
+                self._session.rollback()
+                if attempt:            # second failure -> surface it, never hide it
+                    raise
+                # Genuine collision: give this event its own id and retry once.
+                model.event_id = f"{model.event_id}-{uuid.uuid4().hex[:8]}"
+                event_id = model.event_id
+                model.chain_hash = self._compute_hash(
+                    self._get_previous_hash(),
+                    f"{event_id}:{event.actor_type}:{event.actor_id}:{event.action}:{event.decision}")
+            except Exception:
+                self._session.rollback()
+                raise
         return event
 
     def list_all(self, limit: int = 1000) -> list[AuditEventModel]:
@@ -359,3 +417,180 @@ class AuditEventRepository:
         if not metadata:
             return None
         return {k: v for k, v in metadata.items() if k not in {"api_key", "apikey", "Authorization", "token", "password", "secret", "private_key"}}
+
+
+# =============================================================================
+# PostgreSQL-backed Approval Repository
+# =============================================================================
+
+from safenestt.security.approval import ApprovalRepository as BaseApprovalRepository
+
+
+class PersistentApprovalRepository(BaseApprovalRepository):
+    """PostgreSQL-backed repository for approval records."""
+
+    def create(self, record: Any) -> Any:
+        """Create a new approval record."""
+        with session_scope() as session:
+            model = ApprovalModel(
+                approval_id=record.approval_id,
+                agent_id=record.agent_id,
+                tool_id=record.tool_id,
+                action=record.action,
+                requested_capability=record.requested_capability,
+                risk_level=record.risk_level,
+                requester_context=record.requester_context or {},
+                created_at=record.created_at or datetime.now(UTC),
+                expiration_at=record.expiration_at,
+                decision_at=record.decision_at,
+                approver_identity=record.approver_identity,
+                status=record.status or "pending",
+                redacted_metadata=record.redacted_metadata or {},
+                tenant_id=record.organization_id,
+            )
+            session.add(model)
+            session.flush()
+            return self._to_record(model)
+
+    def get(self, approval_id: str, *, organization_id: str | None = None) -> Any | None:
+        """Get an approval record by ID, optionally scoped to tenant."""
+        with session_scope() as session:
+            stmt = select(ApprovalModel).where(ApprovalModel.approval_id == approval_id)
+            if organization_id:
+                stmt = stmt.where(
+                    (ApprovalModel.tenant_id == organization_id) | (ApprovalModel.tenant_id.is_(None))
+                )
+            result = session.execute(stmt).scalar_one_or_none()
+            return self._to_record(result) if result else None
+
+    def approve(self, approval_id: str, *, approver_identity: str | None = None, metadata: dict[str, Any] | None = None, organization_id: str | None = None) -> Any | None:
+        """Approve a pending approval."""
+        with session_scope() as session:
+            stmt = (
+                update(ApprovalModel)
+                .where(ApprovalModel.approval_id == approval_id)
+                .where(ApprovalModel.status == "pending")
+                .values(
+                    status="approved",
+                    decision_at=datetime.now(UTC),
+                    approver_identity=approver_identity,
+                    redacted_metadata=metadata or {},
+                )
+                .returning(ApprovalModel)
+            )
+            if organization_id:
+                stmt = stmt.where(
+                    (ApprovalModel.tenant_id == organization_id) | (ApprovalModel.tenant_id.is_(None))
+                )
+            result = session.execute(stmt).scalar_one_or_none()
+            return self._to_record(result) if result else None
+
+    def reject(self, approval_id: str, *, approver_identity: str | None = None, metadata: dict[str, Any] | None = None, organization_id: str | None = None) -> Any | None:
+        """Reject a pending approval."""
+        with session_scope() as session:
+            stmt = (
+                update(ApprovalModel)
+                .where(ApprovalModel.approval_id == approval_id)
+                .where(ApprovalModel.status == "pending")
+                .values(
+                    status="rejected",
+                    decision_at=datetime.now(UTC),
+                    approver_identity=approver_identity,
+                    redacted_metadata=metadata or {},
+                )
+                .returning(ApprovalModel)
+            )
+            if organization_id:
+                stmt = stmt.where(
+                    (ApprovalModel.tenant_id == organization_id) | (ApprovalModel.tenant_id.is_(None))
+                )
+            result = session.execute(stmt).scalar_one_or_none()
+            return self._to_record(result) if result else None
+
+    def cancel(self, approval_id: str, *, organization_id: str | None = None) -> Any | None:
+        """Cancel a pending approval."""
+        with session_scope() as session:
+            stmt = (
+                update(ApprovalModel)
+                .where(ApprovalModel.approval_id == approval_id)
+                .where(ApprovalModel.status == "pending")
+                .values(status="cancelled", decision_at=datetime.now(UTC))
+                .returning(ApprovalModel)
+            )
+            if organization_id:
+                stmt = stmt.where(
+                    (ApprovalModel.tenant_id == organization_id) | (ApprovalModel.tenant_id.is_(None))
+                )
+            result = session.execute(stmt).scalar_one_or_none()
+            return self._to_record(result) if result else None
+
+    def expire(self, approval_id: str, *, organization_id: str | None = None) -> Any | None:
+        """Mark an approval as expired."""
+        with session_scope() as session:
+            stmt = (
+                update(ApprovalModel)
+                .where(ApprovalModel.approval_id == approval_id)
+                .where(ApprovalModel.status == "pending")
+                .values(status="expired", decision_at=datetime.now(UTC))
+                .returning(ApprovalModel)
+            )
+            if organization_id:
+                stmt = stmt.where(
+                    (ApprovalModel.tenant_id == organization_id) | (ApprovalModel.tenant_id.is_(None))
+                )
+            result = session.execute(stmt).scalar_one_or_none()
+            return self._to_record(result) if result else None
+
+    def list_pending(self, *, organization_id: str | None = None) -> list[Any]:
+        """List all pending approvals, optionally scoped to tenant."""
+        with session_scope() as session:
+            stmt = select(ApprovalModel).where(ApprovalModel.status == "pending")
+            if organization_id:
+                stmt = stmt.where(
+                    (ApprovalModel.tenant_id == organization_id) | (ApprovalModel.tenant_id.is_(None))
+                )
+            stmt = stmt.order_by(ApprovalModel.created_at.desc())
+            results = session.execute(stmt).scalars().all()
+            return [self._to_record(r) for r in results]
+
+    def list_for_agent(self, agent_id: str, *, organization_id: str | None = None) -> list[Any]:
+        """List all approvals for a specific agent."""
+        with session_scope() as session:
+            stmt = select(ApprovalModel).where(ApprovalModel.agent_id == agent_id)
+            if organization_id:
+                stmt = stmt.where(
+                    (ApprovalModel.tenant_id == organization_id) | (ApprovalModel.tenant_id.is_(None))
+                )
+            results = session.execute(stmt).scalars().all()
+            return [self._to_record(r) for r in results]
+
+    def list_for_tool(self, tool_id: str, *, organization_id: str | None = None) -> list[Any]:
+        """List all approvals for a specific tool."""
+        with session_scope() as session:
+            stmt = select(ApprovalModel).where(ApprovalModel.tool_id == tool_id)
+            if organization_id:
+                stmt = stmt.where(
+                    (ApprovalModel.tenant_id == organization_id) | (ApprovalModel.tenant_id.is_(None))
+                )
+            results = session.execute(stmt).scalars().all()
+            return [self._to_record(r) for r in results]
+
+    def _to_record(self, model: ApprovalModel) -> Any:
+        """Convert a model to an ApprovalRecord."""
+        from safenestt.security.approval import ApprovalRecord
+        return ApprovalRecord(
+            approval_id=model.approval_id,
+            agent_id=model.agent_id,
+            tool_id=model.tool_id,
+            action=model.action,
+            requested_capability=model.requested_capability,
+            risk_level=model.risk_level,
+            requester_context=model.requester_context or {},
+            created_at=model.created_at,
+            expiration_at=model.expiration_at,
+            decision_at=model.decision_at,
+            approver_identity=model.approver_identity,
+            status=model.status,
+            redacted_metadata=model.redacted_metadata or {},
+            organization_id=model.tenant_id,
+        )

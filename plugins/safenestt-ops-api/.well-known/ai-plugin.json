@@ -1,0 +1,15 @@
+{
+  "schema_version": "v1",
+  "name_for_model": "safenestt-ops",
+  "name_for_human": "SafeNestT Operations",
+  "description": "Read-only SafeNestT operations & observability: audit_events, findings, agent_runs, RLS status, service health. Local/private beta.",
+  "author": "SafeNestT operations",
+  "icon": "https://github.com/Amir2051/safenestt-ai/raw/main/docs/logo.png",
+  "contact_email": "ops@safenestt.com",
+  "contact_url": "https://safenestt.com/ops",
+  "server": {"host": "127.0.0.1", "port": 8321, "protocol": "https"},
+  "api_version": "v1",
+  "auth": {"type": "api_key", "in": "header", "name": "X-API-Key"},
+  "logo_url": "https://github.com/Amir2051/safenestt-ai/raw/main/docs/logo.png",
+  "legal_info_url": "https://safenestt.com/legal/privacypolicy"
+}

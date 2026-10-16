@@ -57,6 +57,10 @@ class ApprovalRepository(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def list_pending(self, *, organization_id: str | None = None) -> list[ApprovalRecord]:
+        raise NotImplementedError
+
+    @abstractmethod
     def list_for_agent(self, agent_id: str, *, organization_id: str | None = None) -> list[ApprovalRecord]:
         raise NotImplementedError
 
@@ -140,6 +144,9 @@ class InMemoryApprovalRepository(ApprovalRepository):
     def list_for_tool(self, tool_id: str, *, organization_id: str | None = None) -> list[ApprovalRecord]:
         return [record for record in self.store.records.values() if record.tool_id == tool_id and self._require_tenant(record, organization_id) is not None]
 
+    def list_pending(self, *, organization_id: str | None = None) -> list[ApprovalRecord]:
+        return [record for record in self.store.records.values() if record.status == "pending" and self._require_tenant(record, organization_id) is not None]
+
 
 class ApprovalService:
     def __init__(self, repository: ApprovalRepository | None = None) -> None:
@@ -161,11 +168,13 @@ class ApprovalService:
         return self.repository.create(record)
 
     def record_decision(self, approval_id: str, approved: bool, *, organization_id: str | None = None, approver_identity: str | None = None, metadata: dict[str, Any] | None = None) -> ApprovalRecord | None:
+        """Record an approval decision. Delegates to repository approve/reject."""
         if approved:
             return self.repository.approve(approval_id, approver_identity=approver_identity, metadata=metadata, organization_id=organization_id)
         return self.repository.reject(approval_id, approver_identity=approver_identity, metadata=metadata, organization_id=organization_id)
 
     def is_approved(self, approval_id: str, *, organization_id: str | None = None) -> bool:
+        """Check whether an approval request has been approved and not expired."""
         record = self.repository.get(approval_id, organization_id=organization_id)
         if not record:
             return False

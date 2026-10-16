@@ -68,24 +68,56 @@ class ThreatIntelAgent(BaseAgent):
     def _sanitize_tool_call(self, capability: str, result: dict[str, Any]) -> dict[str, Any]:
         safe = dict(result)
         safe.pop("metadata", None)
-        return {"capability": capability, "status": safe.get("status"), "tool_status": safe.get("status")}
+        # Adapter returns flat structure; top-level keys ARE the result data
+        result_status = safe.get("status")
+        allowed = result_status == "success"
+        return {
+            "capability": capability,
+            "status": safe.get("status"),
+            "tool_status": "ALLOW" if allowed else result_status,
+            "source": safe.get("source"),
+            "result": {
+                "source": safe.get("source"),
+                "data": safe.get("data", {}),
+                "confidence": safe.get("confidence", 0.65 if allowed else 0.0),
+                "target": safe.get("target") or safe.get("query") or "",
+            },
+        }
+
+    @staticmethod
+    def _has_substantive_data(value: Any) -> bool:
+        """True only when a provider returned useful observations, not empty envelopes."""
+        ignored = {"source", "query", "domain", "target", "timestamp", "collected_at", "count", "summary", "confidence", "score", "status", "message"}
+        if value is None or value is False or value == 0:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, dict):
+            return any(
+                ThreatIntelAgent._has_substantive_data(v)
+                for k, v in value.items()
+                if str(k).lower() not in ignored and not str(k).startswith("_")
+            )
+        if isinstance(value, (list, tuple, set)):
+            return any(ThreatIntelAgent._has_substantive_data(v) for v in value)
+        return bool(value)
 
     def _to_finding(self, run: AgentRun, capability: str, result: dict[str, Any]) -> Finding | None:
         data = result.get("data") or {}
         status = result.get("status")
         source = data.get("source", "cyber_intel")
+        if status not in {"success", "partial"} or not self._has_substantive_data(data):
+            # Empty provider responses are logged in tool_calls, not promoted to findings.
+            # A successful HTTP/API call is not itself evidence of a threat.
+            return None
         if status == "success":
-            description = data.get("summary") or f"Threat intel lookup for {capability}"
+            description = data.get("summary") or f"Threat intel returned observations for {capability}"
             confidence = 0.65
             limitations = ["Threat intelligence requires corroboration before use in proceedings."]
-        elif status == "partial":
+        else:
             description = f"Threat intel lookup partial for {capability} (source: {source})"
             confidence = 0.3
             limitations = data.get("_errors", ["Partial data returned"])
-        else:
-            description = f"Threat intel lookup failed or returned no data for {capability}."
-            confidence = 0.0
-            limitations = ["External lookup did not return usable data; do not treat absence as negative evidence."]
         provenance = Provenance(
             case_id=str(run.inputs.get("case_id") or ""),
             investigation_id=str(run.inputs.get("investigation_id") or ""),

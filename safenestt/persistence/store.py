@@ -60,15 +60,40 @@ class PersistentStore:
 
 
 class PersistentAuditLogger:
-    def __init__(self, store: PersistentStore | None = None) -> None:
-        self.store = store or PersistentStore()
+    """Lazy-initialized persistent audit logger.
+
+    Store is created on first use, not at construction time, to avoid
+    import-time dependencies on engine initialization.
+    """
+
+    def __init__(self, store: PersistentStore | None = None,
+                 tenant_id: str | None = None, key_fingerprint: str | None = None) -> None:
+        self._store = store
+        self._initialized = store is not None
+        self._tenant_id = tenant_id
+        self._key_fingerprint = key_fingerprint
+
+    def _ensure_store(self) -> PersistentStore:
+        if not self._initialized:
+            self._store = PersistentStore()
+            self._initialized = True
+        assert self._store is not None
+        return self._store
 
     def record(self, event: Any) -> Any:
-        self.store.audit.record(event)
+        store = self._ensure_store()
+        # Audit events are written on this logger's own session. Establish the
+        # tenant context on that session so RLS permits the insert and the row
+        # is tenant-scoped (authorization/system events have no investigation_id).
+        if self._tenant_id and self._key_fingerprint:
+            from safenestt.persistence.rls import set_tenant_context
+            set_tenant_context(store.audit._session.connection(),
+                               self._tenant_id, self._key_fingerprint)
+        store.audit.record(event)
         return event
 
     def recent(self, limit: int = 100) -> list[Any]:
-        with self.store._session() as s:
+        with self._ensure_store()._session() as s:
             return list(
                 s.execute(
                     text("SELECT * FROM audit_events ORDER BY created_at DESC LIMIT :limit").bindparams(limit=limit)
@@ -77,11 +102,25 @@ class PersistentAuditLogger:
 
 
 class PersistentApprovalRepository:
+    """Lazy-initialized persistent approval repository.
+
+    Store is created on first use, not at construction time, to avoid
+    import-time dependencies on engine initialization.
+    """
+
     def __init__(self, store: PersistentStore | None = None) -> None:
-        self.store = store or PersistentStore()
+        self._store = store
+        self._initialized = store is not None
+
+    def _ensure_store(self) -> PersistentStore:
+        if not self._initialized:
+            self._store = PersistentStore()
+            self._initialized = True
+        assert self._store is not None
+        return self._store
 
     def create(self, record: Any) -> Any:
-        self.store.audit.record(
+        self._ensure_store().audit.record(
             type("AuditEvent", (), {
                 "event_id": f"approval-{record.approval_id}",
                 "investigation_id": None,

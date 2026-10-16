@@ -1,20 +1,21 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 from safenestt.investigations.records import EvidenceRecord, FindingRecord, InvestigationRecord, InvalidStatusError
 from safenestt.investigations.risk import calculate_risk
 from safenestt.investigations.store import PersistentInvestigationStore, TenantIsolationError
+from safenestt.persistence.store import PersistentAuditLogger
 from safenestt.investigations.reality import RealityChecker
 from safenestt.model.provider import ModelProvider, ModelRequest, ModelResponse
 from safenestt.registry import AgentRecord, AgentRegistry, AgentStatus, RiskLevel
 from safenestt.security.approval import ApprovalService
-from safenestt.security.audit import AuditEvent, AuditLogger
-from safenestt.security.pipeline import SecurityPipeline
 from safenestt.security.permissions import PermissionManager
-from safenestt.security.rate_limit import RateLimitService
 from safenestt.security.redaction import redact
 from safenestt.tools.dns import DNSAdapter
 from safenestt.tools.interface import ToolInterface
@@ -104,11 +105,24 @@ def _case_context(target: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
     return str(parsed.get("description") or target), indicators, parsed
 
 
-def run_investigation(*, investigation_id: str, target: str, tenant_id: str | None = None, created_by: str | None = None, model_provider: ModelProvider | None = None, store: PersistentInvestigationStore | None = None, dry_run: bool = False, api_key_hash: str | None = None) -> dict[str, Any]:
+def run_investigation(
+    *,
+    investigation_id: str,
+    target: str,
+    tenant_id: str | None = None,
+    created_by: str | None = None,
+    case_id: str | None = None,
+    model_provider: ModelProvider | None = None,
+    store: PersistentInvestigationStore | None = None,
+    dry_run: bool = False,
+    api_key_hash: str | None = None,
+    key_fingerprint: str | None = None,
+) -> dict[str, Any]:
     if store is None:
-        store = PersistentInvestigationStore(api_key_hash=api_key_hash)
-    permission_manager = PermissionManager()
-    pipeline = SecurityPipeline(permission_manager=permission_manager, approval_service=ApprovalService(), rate_limit_service=RateLimitService(), audit_logger=AuditLogger())
+        store = PersistentInvestigationStore(tenant_id=tenant_id, key_fingerprint=key_fingerprint)
+    permission_manager = PermissionManager(
+        audit_logger=PersistentAuditLogger(tenant_id=tenant_id, key_fingerprint=key_fingerprint)
+    )
     tool_interface = ToolInterface(permission_manager=permission_manager)
     checker = RealityChecker(evidence_lookup=lambda investigation_id, evidence_id: next((e for e in store.list_evidence(investigation_id) if e.evidence_id == evidence_id), None))
     agent = AgentRecord(agent_id="investigator", name="Investigator", enabled=True, status=AgentStatus.ACTIVE, capabilities=["tools.dns.lookup.lookup"], risk_level=RiskLevel.LOW)
@@ -119,7 +133,15 @@ def run_investigation(*, investigation_id: str, target: str, tenant_id: str | No
     except TenantIsolationError:
         record = None
     if not record:
-        record = InvestigationRecord(investigation_id=investigation_id, tenant_id=tenant_id, created_by=created_by, target=target, type="domain", status="QUEUED")
+        record = InvestigationRecord(
+            investigation_id=investigation_id,
+            tenant_id=tenant_id,
+            created_by=created_by,
+            target=target,
+            type="domain",
+            status="QUEUED",
+            case_id=case_id,
+        )
         record = store.create_investigation(record)
     elif record.status in {"FAILED", "CANCELLED"}:
         record.mark("QUEUED")
@@ -161,24 +183,33 @@ def run_investigation(*, investigation_id: str, target: str, tenant_id: str | No
 
     investigation_schema = Investigation(
         investigation_id=investigation_id,
-        case_id=investigation_id,
+        case_id=case_id or investigation_id,
         status="running",
     )
 
     human_target, indicators, case_context = _case_context(record.target or target)
-    orchestrator = InvestigationOrchestrator(permission_manager=PermissionManager())
+    orchestrator = InvestigationOrchestrator(
+        permission_manager=PermissionManager(
+            audit_logger=PersistentAuditLogger(tenant_id=tenant_id, key_fingerprint=key_fingerprint)
+        )
+    )
     orchestrator_inputs: dict[str, Any] = {
         "target": human_target,
         "investigation_id": investigation_id,
-        "case_id": investigation_id,
+        "case_id": case_id or investigation_id,
         "created_by": created_by,
         "tenant_id": tenant_id,
+        "organization_id": tenant_id,
         "indicators": indicators,
         "case_context": case_context,
     }
 
     try:
         orch_result = orchestrator.orchestrate(investigation_schema, orchestrator_inputs)
+        # Persist agent runs created during orchestration
+        agent_runs_data = orch_result.get("agent_runs", [])
+        if agent_runs_data:
+            store.add_agent_runs(investigation_id, agent_runs_data)
     except Exception as exc:
         record.error = {"code": "orchestration_failed", "message": str(exc)}
         try:
@@ -201,6 +232,105 @@ def run_investigation(*, investigation_id: str, target: str, tenant_id: str | No
             "error": record.error,
         }
 
+    # ---- Build evidence and findings from orchestrator output ----
+    # These are persisted BEFORE model synthesis so that partial results
+    # survive even if the model call fails.  The model adds a synthesis
+    # finding on top, but the raw agent/provider data is not lost.
+    evidence_items: list[EvidenceRecord] = []
+    findings: list[FindingRecord] = []
+    tool_calls = 0
+
+    for run_data in orch_result.get("agent_runs", []):
+        tool_calls += len(run_data.get("tool_calls", []))
+        provider_result = run_data.get("outputs", {}).get("provider_result")
+        if provider_result and isinstance(provider_result, dict) and provider_result.get("status") == "success":
+            _target = (
+                provider_result.get("data", {}).get("address")
+                or provider_result.get("data", {}).get("target")
+                or provider_result.get("data", {}).get("query")
+                or target
+            )
+            synthetic_tc = {
+                "tool_id": provider_result.get("tool_id", ""),
+                "action": provider_result.get("action", ""),
+                "status": "success",
+                "tool_status": "ALLOW",
+                "capability": provider_result.get("action", ""),
+                "result": provider_result.get("data", {}),
+                "result_raw": provider_result,
+            }
+            _tc_list = run_data.get("tool_calls", [])
+            if not any(tc.get("tool_id") == synthetic_tc["tool_id"] for tc in _tc_list):
+                _tc_list = _tc_list + [synthetic_tc]
+                run_data["tool_calls"] = _tc_list
+
+    # Persist each successful tool observation ONCE. Previously evidence creation
+    # happened inside the finding loop, multiplying the same tool result by the
+    # number of findings and making risk/evidence counts misleading.
+    evidence_ids_by_run: dict[str, list[str]] = {}
+    for run_data in orch_result.get("agent_runs", []):
+        run_id = run_data.get("run_id")
+        for tc in run_data.get("tool_calls", []):
+            if tc.get("tool_status") != "ALLOW":
+                continue
+            tc_result = tc.get("result", {}) or {}
+            ev_target = (
+                tc_result.get("target")
+                or tc_result.get("address")
+                or tc_result.get("query")
+                or target
+            )
+            ev_id = _stable_id()
+            evidence_ids_by_run.setdefault(str(run_id or ""), []).append(ev_id)
+            evidence_items.append(EvidenceRecord(
+                investigation_id=investigation_id,
+                evidence_id=ev_id,
+                source=tc_result.get("source") or tc.get("capability", "unknown"),
+                source_type="tool",
+                target=ev_target,
+                observed_at=_now(),
+                data={
+                    "tool_call": tc,
+                    "provider": tc_result.get("provider"),
+                    "data": tc_result.get("data"),
+                },
+                confidence=tc_result.get("confidence", 0.0),
+                provenance=tc_result.get("source") or tc.get("capability", ""),
+                tool_run_id=run_id,
+            ))
+
+    all_evidence_ids = [item.evidence_id for item in evidence_items]
+    for finding_data in orch_result.get("findings", []):
+        finding_id = finding_data.get("finding_id") or _stable_id()
+        finding_type = finding_data.get("finding_type", "AI_INFERENCE")
+        provenance = finding_data.get("provenance") or {}
+        source_run_id = provenance.get("agent_run_id") if isinstance(provenance, dict) else None
+        evidence_ids = list(evidence_ids_by_run.get(str(source_run_id or ""), []))
+        # General synthesis/inference findings may reference the shared evidence set,
+        # but the evidence rows themselves are never duplicated for each finding.
+        if finding_type == "AI_INFERENCE" and not source_run_id:
+            evidence_ids = list(all_evidence_ids)
+        finding = FindingRecord(
+            investigation_id=investigation_id,
+            finding_id=finding_id,
+            claim=finding_data.get("description") or finding_data.get("title", "Orchestrator finding"),
+            evidence_ids=evidence_ids,
+            reality_status=finding_type if finding_type in ("EXTERNAL_INTELLIGENCE", "VERIFIED_EVIDENCE") else "AI_INFERENCE",
+            risk_score=finding_data.get("confidence", 0.0),
+            factors={"finding_type": finding_type, **finding_data.get("metadata", {})},
+        )
+        evaluated = checker.evaluate(finding)
+        finding.reality_status = evaluated.reality_status
+        findings.append(finding)
+
+    # ---- PERSIST evidence + findings BEFORE model synthesis ----
+    # If the model call fails, the raw agent/provider data is not lost.
+    for ev in evidence_items:
+        store.add_evidence(ev)
+    for finding in findings:
+        store.add_finding(finding)
+
+    # ---- Model synthesis (best-effort; failures must not lose persisted data) ----
     model_response = provider.generate(ModelRequest(
         prompt=("You are the senior SafeNestT fraud investigator. Review the multi-agent findings below. "
                 "Do not invent facts. Return a concise investigation synthesis and next steps.\n" +
@@ -210,59 +340,32 @@ def run_investigation(*, investigation_id: str, target: str, tenant_id: str | No
         max_tokens=1200,
         response_format="json_object",
     ))
-    if model_response.error:
-        record.error = {"code": "model_synthesis_failed", "message": model_response.error.message}
-        record.mark("FAILED")
-        store.update_investigation(record)
-        return {"investigation_id": investigation_id, "status": "FAILED", "target": target, "tenant_id": tenant_id, "created_by": created_by, "tool_calls": 0, "evidence": [], "findings": [], "risk": calculate_risk([]), "model_provider": getattr(provider, "provider_name", None), "model": getattr(provider, "default_model", None), "error": record.error}
-
     model_claim = (model_response.content or "").strip()
-    # ---- Transform orchestrator output to API format ----
-    evidence_items: list[EvidenceRecord] = []
-    findings: list[FindingRecord] = []
-    tool_calls = 0
-
-    for run_data in orch_result.get("agent_runs", []):
-        tool_calls += len(run_data.get("tool_calls", []))
-
-    for finding_data in orch_result.get("findings", []):
-        finding_id = finding_data.get("finding_id") or _stable_id()
-        evidence_ids = finding_data.get("evidence_ids") or []
-        # Create evidence from tool_calls if not already present
-        for run_data in orch_result.get("agent_runs", []):
-            for tc in run_data.get("tool_calls", []):
-                if tc.get("status") == "ALLOW":
-                    ev_id = _stable_id()
-                    evidence_ids.append(ev_id)
-                    evidence_items.append(EvidenceRecord(
-                        investigation_id=investigation_id,
-                        evidence_id=ev_id,
-                        source=tc.get("capability", "unknown"),
-                        source_type="tool",
-                        target=target,
-                        observed_at=_now(),
-                        data={"tool_call": tc},
-                        confidence=0.7 if tc.get("tool_status") == "success" else 0.0,
-                        provenance=tc.get("capability"),
-                        tool_run_id=_stable_id(),
-                    ))
-        finding = FindingRecord(
-            investigation_id=investigation_id,
-            finding_id=finding_id,
-            claim=finding_data.get("description") or finding_data.get("title", "Orchestrator finding"),
-            evidence_ids=evidence_ids,
-            reality_status="AI_INFERENCE",
-            risk_score=finding_data.get("confidence", 0.0),
-        )
-        evaluated = checker.evaluate(finding)
-        finding.reality_status = evaluated.reality_status
-        findings.append(finding)
-
-    # Store evidence and findings
-    for ev in evidence_items:
-        store.add_evidence(ev)
-    for finding in findings:
-        store.add_finding(finding)
+    if model_response.error:
+        # Synthesis is explicitly best-effort (see the comment above): evidence,
+        # findings, agent runs and the graph are ALREADY persisted at this point.
+        # A local model timing out must not discard them and report the whole
+        # investigation as FAILED -- that hides real, durable work behind a
+        # non-essential narrative step. Record the structured error and finish as
+        # COMPLETED_WITH_ERRORS so callers can see exactly what was degraded.
+        record.error = {"code": "model_synthesis_failed", "message": model_response.error.message}
+        record.mark("COMPLETED_WITH_ERRORS")
+        store.update_investigation(record)
+        return {
+            "investigation_id": investigation_id,
+            "status": "COMPLETED_WITH_ERRORS",
+            "target": target,
+            "tenant_id": tenant_id,
+            "created_by": created_by,
+            "tool_calls": tool_calls,
+            "agent_runs": orch_result.get("agent_runs", []),
+            "evidence": [evidence.__dict__ for evidence in evidence_items],
+            "findings": [finding.__dict__ for finding in findings],
+            "risk": calculate_risk(findings),
+            "model_provider": getattr(provider, "provider_name", None),
+            "model": getattr(provider, "default_model", None),
+            "error": record.error,
+        }
 
     if model_claim:
         model_finding = FindingRecord(
@@ -270,10 +373,15 @@ def run_investigation(*, investigation_id: str, target: str, tenant_id: str | No
             finding_id=_stable_id(),
             claim=model_claim[:4000],
             evidence_ids=[item.evidence_id for item in evidence_items],
-            reality_status="AI_INFERENCE",
             risk_score=0.5,
+            agent="investigator",
             factors={"model": getattr(provider, "default_model", None), "provider": getattr(provider, "provider_name", None)},
         )
+        # Adjudicate through the same RealityChecker the orchestrator path uses
+        # (see above). Previously this path hardcoded reality_status="AI_INFERENCE"
+        # and persisted without evaluation, so model findings were never validated.
+        evaluated_model = checker.evaluate(model_finding)
+        model_finding.reality_status = evaluated_model.reality_status
         store.add_finding(model_finding)
         findings.append(model_finding)
 
@@ -289,8 +397,170 @@ def run_investigation(*, investigation_id: str, target: str, tenant_id: str | No
     record.mark("CALCULATING_RISK")
     record = store.update_investigation(record)
     risk = calculate_risk(findings)
+
+    # ---- Build the intelligence/dossier BEFORE any persistence of it ----
+    # Order matters: add_report() below must receive the real completed
+    # dossier object. Reading `intelligence` before this assignment was a
+    # NameError that a bare `except: pass` swallowed, so every investigation
+    # reported COMPLETED while persisting zero report rows.
+    from safenestt.investigations.intelligence import build_dossier_intelligence
+    intelligence = build_dossier_intelligence(
+        target=target,
+        findings=[finding.__dict__ for finding in findings],
+        evidence=[evidence.__dict__ for evidence in evidence_items],
+        indicators=indicators,
+    )
+
+    # ---- Persist the dossier/report ----
+    # Critical persistence path: a failure here MUST be visible. The
+    # investigation is not allowed to look fully COMPLETED with no report
+    # on disk. We record the failure on the investigation itself (error
+    # field + COMPLETED_WITH_ERRORS marker) instead of swallowing it.
+    report_persisted = False
+    try:
+        store.add_report(
+            investigation_id=investigation_id,
+            draft=intelligence.get("dossier"),
+            review_state="draft",
+            approval_state="pending",
+        )
+        report_persisted = True
+    except Exception as report_err:
+        logger.exception(
+            "report_persistence_failed investigation=%s tenant=%s error=%s",
+            investigation_id, tenant_id, report_err,
+        )
+        intelligence["report_persistence_error"] = {
+            "code": "report_persistence_failed",
+            "type": type(report_err).__name__,
+            "message": str(report_err)[:300],
+        }
+        record.error = {
+            "code": "report_persistence_failed",
+            "message": str(report_err)[:300],
+        }
+        record.mark("COMPLETED_WITH_ERRORS")
+        record = store.update_investigation(record)
+        return {
+            "investigation_id": investigation_id,
+            "status": "COMPLETED_WITH_ERRORS",
+            "target": target,
+            "tenant_id": tenant_id,
+            "created_by": created_by,
+            "tool_calls": tool_calls,
+            "agent_runs": orch_result.get("agent_runs", []),
+            "evidence": [evidence.__dict__ for evidence in evidence_items],
+            "findings": [finding.__dict__ for finding in findings],
+            "risk": risk,
+            "intelligence": intelligence,
+            "report_persisted": False,
+            "model_provider": getattr(provider, "provider_name", None),
+            "model": getattr(provider, "default_model", None),
+        }
+
     record.mark("COMPLETED")
     record = store.update_investigation(record)
+    intelligence["report_persisted"] = True
+
+    # Hermes->Base44 bridge: transform persisted records for Base44 consumption
+    effective_case_id = case_id or investigation_id
+    try:
+        from safenestt.bridge.transformation import bridge_investigation
+        bridge_result = bridge_investigation(
+            hermes_inv=record,
+            findings=findings,
+            evidence=evidence_items,
+            case_id=effective_case_id,
+            provider_tool_calls=orch_result.get("agent_runs", []),
+        )
+        intelligence["bridge"] = {
+            "case_id": bridge_result.case_id,
+            "case_evidence_items_count": len(bridge_result.case_evidence_items),
+            "graph_nodes_count": len(bridge_result.graph_nodes),
+            "graph_edges_count": len(bridge_result.graph_edges),
+            "tool_run_records_count": len(bridge_result.tool_run_records),
+        }
+
+        # Persist graph records to SENTRA PostgreSQL graph tables
+        # (authoritative investigation graph — distinct from Base44 presentation copy)
+        # bridge_investigation returns plain dicts (Base44-ready shape), but the
+        # store's add_graph_* methods address record attributes. Convert back to
+        # the canonical records before persisting — passing dicts raised
+        # AttributeError and silently persisted zero nodes.
+        from safenestt.bridge.transformation import GraphNodeRecord, GraphEdgeRecord
+        nodes = [
+            GraphNodeRecord(
+                id=n["id"],
+                investigation_id=investigation_id,
+                case_id=n.get("case_id", effective_case_id),
+                node_key=n["id"],
+                node_type=n.get("node_type", "entity"),
+                label=n.get("label", ""),
+                node_data=n.get("node_data") or {},
+                source="hermes",
+                provenance="hermes_bridge",
+            )
+            for n in bridge_result.graph_nodes
+        ]
+        edges = [
+            GraphEdgeRecord(
+                id=e["id"],
+                investigation_id=investigation_id,
+                case_id=e.get("case_id", effective_case_id),
+                edge_key=e["id"],
+                source_node_id=e["source_node_id"],
+                target_node_id=e["target_node_id"],
+                edge_type=e.get("edge_type", "related"),
+                edge_label=e.get("edge_label", ""),
+                edge_data=e.get("edge_data") or {},
+                source="hermes",
+                provenance="hermes_bridge",
+            )
+            for e in bridge_result.graph_edges
+        ]
+        persisted_nodes = 0
+        persisted_edges = 0
+        for gn in nodes:
+            store.add_graph_node(gn)
+            persisted_nodes += 1
+        for ge in edges:
+            store.add_graph_edge(ge)
+            persisted_edges += 1
+        intelligence["bridge"]["graph_nodes_persisted"] = persisted_nodes
+        intelligence["bridge"]["graph_edges_persisted"] = persisted_edges
+    except Exception as bridge_err:
+        # Critical persistence path — surface it, never swallow.
+        logger.exception(
+            "bridge_persistence_failed investigation=%s tenant=%s error=%s",
+            investigation_id, tenant_id, bridge_err,
+        )
+        intelligence["bridge_error"] = {
+            "code": "bridge_persistence_failed",
+            "type": type(bridge_err).__name__,
+            "message": str(bridge_err)[:300],
+        }
+        record.error = {
+            "code": "bridge_persistence_failed",
+            "message": str(bridge_err)[:300],
+        }
+        record.mark("COMPLETED_WITH_ERRORS")
+        record = store.update_investigation(record)
+        return {
+            "investigation_id": investigation_id,
+            "status": "COMPLETED_WITH_ERRORS",
+            "target": target,
+            "tenant_id": tenant_id,
+            "created_by": created_by,
+            "tool_calls": tool_calls,
+            "agent_runs": orch_result.get("agent_runs", []),
+            "evidence": [evidence.__dict__ for evidence in evidence_items],
+            "findings": [finding.__dict__ for finding in findings],
+            "risk": risk,
+            "intelligence": intelligence,
+            "report_persisted": True,
+            "model_provider": getattr(provider, "provider_name", None),
+            "model": getattr(provider, "default_model", None),
+        }
 
     return {
         "investigation_id": investigation_id,
@@ -299,9 +569,12 @@ def run_investigation(*, investigation_id: str, target: str, tenant_id: str | No
         "tenant_id": tenant_id,
         "created_by": created_by,
         "tool_calls": tool_calls,
+        "agent_runs": orch_result.get("agent_runs", []),
         "evidence": [evidence.__dict__ for evidence in evidence_items],
         "findings": [finding.__dict__ for finding in findings],
         "risk": risk,
+        "intelligence": intelligence,
+        "report_persisted": True,
         "model_provider": getattr(provider, "provider_name", None),
         "model": getattr(provider, "default_model", None),
     }

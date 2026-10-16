@@ -147,7 +147,7 @@ class _OpenAICompatibleBase(ModelProvider):
         data = __import__("json").dumps(payload).encode("utf-8")
         req = urllib.request.Request(client["url"], data=data, headers=client["headers"], method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=float(os.getenv("OLLAMA_TIMEOUT", "300"))) as resp:
                 body = __import__("json").loads(resp.read().decode("utf-8"))
         except Exception as exc:
             return ModelResponse(
@@ -219,6 +219,17 @@ class OpenAICompatibleProvider(_OpenAICompatibleBase):
                 usage=ModelUsage(prompt_tokens=2, completion_tokens=3, total_tokens=5),
             )
         return self._execute(request)
+
+
+class OpenRouterProvider(OpenAICompatibleProvider):
+    provider_name = "openrouter"
+
+    def __init__(self, api_key: str | None = None, base_url: str | None = None, default_model: str | None = None) -> None:
+        super().__init__(
+            api_key=api_key or os.getenv("OPENROUTER_API_KEY"),
+            base_url=base_url or os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+            default_model=default_model or os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3.5-lightning:free"),
+        )
 
 
 class AnthropicCompatibleProvider(_OpenAICompatibleBase):
