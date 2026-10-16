@@ -174,3 +174,32 @@ def test_orchestrator_runs_conditional_agents() -> None:
     assert result["status"] == "completed"
     assert result["findings"]
     assert result["approved_findings"] >= 0
+
+
+def test_threat_intel_empty_success_response_is_not_a_finding():
+    agent = ThreatIntelAgent(FakeAgentRecord(), permission_manager=_permission_manager())
+    run = AgentRun(run_id="run-empty", agent_id="threat_intel", inputs=_run_inputs())
+    result = {
+        "status": "success",
+        "data": {"items": [], "source": "dehashed", "query": "example.com"},
+    }
+    assert agent._to_finding(run, "cyber_intel.threat_intel.dehashed_search", result) is None
+
+
+def test_threat_intel_empty_shodan_envelope_is_not_a_finding():
+    agent = ThreatIntelAgent(FakeAgentRecord(), permission_manager=_permission_manager())
+    run = AgentRun(run_id="run-empty-shodan", agent_id="threat_intel", inputs=_run_inputs())
+    result = {
+        "status": "success",
+        "data": {"domain": "example.com", "dns": {}, "whois": None, "subdomains": [], "source": "shodan_domain"},
+    }
+    assert agent._to_finding(run, "cyber_intel.threat_intel.shodan_domain", result) is None
+
+
+def test_external_provider_empty_success_envelope_is_not_a_finding():
+    orchestrator = InvestigationOrchestrator(permission_manager=_permission_manager())
+    investigation = Investigation(investigation_id="inv-empty", case_id="case-empty", status="running")
+    result = {"status": "success", "data": {"results": [], "query": "example.com", "source": "firecrawl"}}
+    assert orchestrator._provider_findings_from_result(
+        result, investigation, "run-empty", "provider-firecrawl", "cyber_intel.firecrawl.web_search"
+    ) == []

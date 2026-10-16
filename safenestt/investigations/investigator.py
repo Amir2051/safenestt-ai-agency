@@ -264,38 +264,52 @@ def run_investigation(
                 _tc_list = _tc_list + [synthetic_tc]
                 run_data["tool_calls"] = _tc_list
 
+    # Persist each successful tool observation ONCE. Previously evidence creation
+    # happened inside the finding loop, multiplying the same tool result by the
+    # number of findings and making risk/evidence counts misleading.
+    evidence_ids_by_run: dict[str, list[str]] = {}
+    for run_data in orch_result.get("agent_runs", []):
+        run_id = run_data.get("run_id")
+        for tc in run_data.get("tool_calls", []):
+            if tc.get("tool_status") != "ALLOW":
+                continue
+            tc_result = tc.get("result", {}) or {}
+            ev_target = (
+                tc_result.get("target")
+                or tc_result.get("address")
+                or tc_result.get("query")
+                or target
+            )
+            ev_id = _stable_id()
+            evidence_ids_by_run.setdefault(str(run_id or ""), []).append(ev_id)
+            evidence_items.append(EvidenceRecord(
+                investigation_id=investigation_id,
+                evidence_id=ev_id,
+                source=tc_result.get("source") or tc.get("capability", "unknown"),
+                source_type="tool",
+                target=ev_target,
+                observed_at=_now(),
+                data={
+                    "tool_call": tc,
+                    "provider": tc_result.get("provider"),
+                    "data": tc_result.get("data"),
+                },
+                confidence=tc_result.get("confidence", 0.0),
+                provenance=tc_result.get("source") or tc.get("capability", ""),
+                tool_run_id=run_id,
+            ))
+
+    all_evidence_ids = [item.evidence_id for item in evidence_items]
     for finding_data in orch_result.get("findings", []):
         finding_id = finding_data.get("finding_id") or _stable_id()
-        evidence_ids: list[str] = []
         finding_type = finding_data.get("finding_type", "AI_INFERENCE")
-        for run_data in orch_result.get("agent_runs", []):
-            for tc in run_data.get("tool_calls", []):
-                if tc.get("tool_status") == "ALLOW":
-                    tc_result = tc.get("result", {}) or {}
-                    ev_target = (
-                        tc_result.get("target")
-                        or tc_result.get("address")
-                        or tc_result.get("query")
-                        or target
-                    )
-                    ev_id = _stable_id()
-                    evidence_ids.append(ev_id)
-                    evidence_items.append(EvidenceRecord(
-                        investigation_id=investigation_id,
-                        evidence_id=ev_id,
-                        source=tc_result.get("source") or tc.get("capability", "unknown"),
-                        source_type="tool",
-                        target=ev_target,
-                        observed_at=_now(),
-                        data={
-                            "tool_call": tc,
-                            "provider": tc_result.get("provider"),
-                            "data": tc_result.get("data"),
-                        },
-                        confidence=tc_result.get("confidence", 0.7 if tc.get("tool_status") == "success" else 0.0),
-                        provenance=tc_result.get("source") or tc.get("capability", ""),
-                        tool_run_id=run_data.get("run_id"),
-                    ))
+        provenance = finding_data.get("provenance") or {}
+        source_run_id = provenance.get("agent_run_id") if isinstance(provenance, dict) else None
+        evidence_ids = list(evidence_ids_by_run.get(str(source_run_id or ""), []))
+        # General synthesis/inference findings may reference the shared evidence set,
+        # but the evidence rows themselves are never duplicated for each finding.
+        if finding_type == "AI_INFERENCE" and not source_run_id:
+            evidence_ids = list(all_evidence_ids)
         finding = FindingRecord(
             investigation_id=investigation_id,
             finding_id=finding_id,

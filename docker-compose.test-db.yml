@@ -1,0 +1,101 @@
+# ============================================================================
+# DEDICATED TEST POSTGRESQL INSTANCE — physical isolation for the test suite
+# ============================================================================
+#
+# WHY THIS EXISTS
+# ---------------
+# On 2026-10-04 the engine test suite destroyed the production database. The
+# in-process guards added afterwards (tests/isolation_guard.py,
+# scripts/ci-safety-gate.sh) block a bad *database name*, but they all point at
+# the SAME PostgreSQL server as production: 127.0.0.1:54322.
+#
+# That is defence in depth with a shared root. If any barrier fails — a future
+# refactor, a raw libpq call, a psycopg2 C-extension path, a psql session typed
+# by hand — the test suite is one mistake away from production again, because
+# both databases live in the same server and differ only by name.
+#
+# This instance removes that coupling entirely:
+#
+#   production : host 127.0.0.1, port 54322, database safenestt_ai
+#               (container supabase_db_safenestt-platform)
+#   test       : host 127.0.0.1, port 55432, database safenestt_ai_test
+#               (container safenestt-test-postgres)
+#
+# Separate port, separate container, separate volume, separate credentials, and
+# NO shared network with the production containers. A test process cannot reach
+# production by accident: it would have to be pointed at port 54322 explicitly,
+# which the CI safety gate and the connection guard both refuse.
+#
+# HOW PYTEST CONNECTS
+# -------------------
+# tests/conftest.py and remediation_tests/conftest.py read DB_HOST/DB_PORT from
+# the environment (defaulting to 127.0.0.1:54322 for backwards compatibility).
+# To use this instance, export the test port:
+#
+#     DB_PORT=55432 python -m pytest tests/
+#
+# scripts/run-tests-isolated.sh does exactly that, and starts this container if
+# it is not already running.
+#
+# The DB user is deliberately NOT `postgres` and has no privileges outside its
+# own database, so a stray DROP inside the test instance cannot reach the
+# production server even if it somehow connected.
+# ============================================================================
+
+name: safenestt-test-db
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: safenestt-test-postgres
+    restart: unless-stopped
+
+    environment:
+      # Distinct superuser name + password. Never the production `postgres`
+      # credentials.
+      POSTGRES_USER: safenestt_test
+      POSTGRES_PASSWORD: safenestt_test_local_only
+      POSTGRES_DB: safenestt_ai_test
+
+    # Bound to loopback ONLY. The test database must never be reachable from
+    # outside this host — the production Postgres port 54322 is published to
+    # 0.0.0.0 by the Supabase container, and this one deliberately is not.
+    ports:
+      - "127.0.0.1:55432:5432"
+
+    volumes:
+      - test_pgdata:/var/lib/postgresql/data
+
+    # NOT attached to supabase_network_safenestt-platform or mia-ai_*.
+    # Default bridge only, so there is no network path to production Postgres.
+    networks:
+      - testnet
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U safenestt_test -d safenestt_ai_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+    # Modest resource ceiling: this is a test fixture, not a production server.
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+    command:
+      # Slightly higher than default so parallel test transactions do not
+      # serialise on locks. Does not weaken correctness: RLS is enforced in the
+      # database, not by connection limits.
+      - postgres
+      - -c
+      - max_connections=200
+
+networks:
+  testnet:
+    driver: bridge
+
+volumes:
+  test_pgdata:
+    name: safenestt-test-pgdata

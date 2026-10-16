@@ -84,22 +84,40 @@ class ThreatIntelAgent(BaseAgent):
             },
         }
 
+    @staticmethod
+    def _has_substantive_data(value: Any) -> bool:
+        """True only when a provider returned useful observations, not empty envelopes."""
+        ignored = {"source", "query", "domain", "target", "timestamp", "collected_at", "count", "summary", "confidence", "score", "status", "message"}
+        if value is None or value is False or value == 0:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, dict):
+            return any(
+                ThreatIntelAgent._has_substantive_data(v)
+                for k, v in value.items()
+                if str(k).lower() not in ignored and not str(k).startswith("_")
+            )
+        if isinstance(value, (list, tuple, set)):
+            return any(ThreatIntelAgent._has_substantive_data(v) for v in value)
+        return bool(value)
+
     def _to_finding(self, run: AgentRun, capability: str, result: dict[str, Any]) -> Finding | None:
         data = result.get("data") or {}
         status = result.get("status")
         source = data.get("source", "cyber_intel")
+        if status not in {"success", "partial"} or not self._has_substantive_data(data):
+            # Empty provider responses are logged in tool_calls, not promoted to findings.
+            # A successful HTTP/API call is not itself evidence of a threat.
+            return None
         if status == "success":
-            description = data.get("summary") or f"Threat intel lookup for {capability}"
+            description = data.get("summary") or f"Threat intel returned observations for {capability}"
             confidence = 0.65
             limitations = ["Threat intelligence requires corroboration before use in proceedings."]
-        elif status == "partial":
+        else:
             description = f"Threat intel lookup partial for {capability} (source: {source})"
             confidence = 0.3
             limitations = data.get("_errors", ["Partial data returned"])
-        else:
-            description = f"Threat intel lookup failed or returned no data for {capability}."
-            confidence = 0.0
-            limitations = ["External lookup did not return usable data; do not treat absence as negative evidence."]
         provenance = Provenance(
             case_id=str(run.inputs.get("case_id") or ""),
             investigation_id=str(run.inputs.get("investigation_id") or ""),

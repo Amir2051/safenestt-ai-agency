@@ -28,6 +28,24 @@ from safenestt.tools.adapters.hunter import HunterAdapter
 from modules.crypto_tracer import EtherscanAdapter  # Etherscan lives in modules/, not adapters/
 
 
+def _has_substantive_payload(value: Any) -> bool:
+    """Reject empty provider envelopes as findings; keep them visible in agent-run output."""
+    ignored = {"source", "query", "domain", "target", "timestamp", "collected_at", "count", "summary", "confidence", "score", "status", "message"}
+    if value is None or value is False or value == 0:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict):
+        return any(
+            _has_substantive_payload(v)
+            for k, v in value.items()
+            if str(k).lower() not in ignored and not str(k).startswith("_")
+        )
+    if isinstance(value, (list, tuple, set)):
+        return any(_has_substantive_payload(v) for v in value)
+    return bool(value)
+
+
 class InvestigationOrchestrator:
     def __init__(self, permission_manager: PermissionManager | None = None) -> None:
         self.permission_manager = permission_manager or PermissionManager()
@@ -200,7 +218,9 @@ class InvestigationOrchestrator:
         if result.get("status") != "success":
             return []
         data = result.get("data", {})
-        if not isinstance(data, dict):
+        if not isinstance(data, dict) or not _has_substantive_payload(data):
+            # Empty/negative provider responses remain in agent_runs, but are not
+            # promoted to threat findings merely because the request succeeded.
             return []
 
         findings: list[Finding] = []
