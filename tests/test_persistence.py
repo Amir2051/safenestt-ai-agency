@@ -743,7 +743,10 @@ class TestTenantIsolation:
             conn_a.autocommit = False
             cur_a = conn_a.cursor()
             cur_a.execute("BEGIN")
-            cur_a.execute("SET LOCAL app.current_tenant = 'tenant-a'")
+            # CodeRabbit PR#3: tenant context comes from the PID-bound
+            # _tenant_context via establish_tenant_context(), not the removed
+            # app.current_tenant GUC. SET LOCAL here no longer resolves a tenant.
+            cur_a.execute("SELECT establish_tenant_context('tenant-a', %s)", (_TEST_KEY_FP_TENANT_A,))
             cur_a.execute("SELECT investigation_id FROM investigations")
             result_a = [r[0] for r in cur_a.fetchall()]
             assert "inv-a" in result_a
@@ -756,7 +759,7 @@ class TestTenantIsolation:
             conn_b.autocommit = False
             cur_b = conn_b.cursor()
             cur_b.execute("BEGIN")
-            cur_b.execute("SET LOCAL app.current_tenant = 'tenant-b'")
+            cur_b.execute("SELECT establish_tenant_context('tenant-b', %s)", (_TEST_KEY_FP_TENANT_B,))
             cur_b.execute("SELECT investigation_id FROM investigations")
             result_b = [r[0] for r in cur_b.fetchall()]
             assert "inv-b" in result_b
@@ -818,7 +821,10 @@ class TestTenantIsolation:
             conn_a.autocommit = False
             cur_a = conn_a.cursor()
             cur_a.execute("BEGIN")
-            cur_a.execute("SET LOCAL app.current_tenant = 'tenant-a'")
+            # CodeRabbit PR#3: tenant context comes from the PID-bound
+            # _tenant_context via establish_tenant_context(), not the removed
+            # app.current_tenant GUC. SET LOCAL here no longer resolves a tenant.
+            cur_a.execute("SELECT establish_tenant_context('tenant-a', %s)", (_TEST_KEY_FP_TENANT_A,))
             cur_a.execute("SELECT finding_id FROM findings")
             result_a = [r[0] for r in cur_a.fetchall()]
             assert "find-a" in result_a
@@ -831,7 +837,7 @@ class TestTenantIsolation:
             conn_b.autocommit = False
             cur_b = conn_b.cursor()
             cur_b.execute("BEGIN")
-            cur_b.execute("SET LOCAL app.current_tenant = 'tenant-b'")
+            cur_b.execute("SELECT establish_tenant_context('tenant-b', %s)", (_TEST_KEY_FP_TENANT_B,))
             cur_b.execute("SELECT finding_id FROM findings")
             result_b = [r[0] for r in cur_b.fetchall()]
             assert "find-b" in result_b
