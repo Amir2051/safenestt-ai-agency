@@ -18,6 +18,9 @@ from pathlib import Path
 from typing import Any
 
 import psycopg2
+from pglast import parse_sql
+from pglast.parser import ParseError
+from pglast.ast import SelectStmt, ExplainStmt
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import APIKeyHeader
@@ -25,7 +28,6 @@ from fastapi.security import APIKeyHeader
 app = FastAPI(title="SafeNestT Operations", version="v1")
 
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
-_READ_ONLY_RE = re.compile(r"^\s*(SELECT|EXPLAIN\s+(ONLY\s+)?(ANALYZE\s+)?)?", re.IGNORECASE)
 
 # ---------------------------------------------------------------------------
 # Configuration (env-driven; no secrets in source)
@@ -125,6 +127,46 @@ def schema(*, api_key: str | None = Header(default=None, alias="X-API-Key")):
     return {"tables": len({r["table_name"] for r in rows}), "columns": rows}
 
 
+def _validate_read_only_sql(sql: str) -> None:
+    """Reject malformed, multi-statement, or non-read-only SQL before DB access."""
+    try:
+        statements = parse_sql(sql)
+    except ParseError as exc:
+        raise HTTPException(status_code=400, detail="invalid SQL syntax") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid SQL statement") from exc
+
+    if len(statements) != 1:
+        raise HTTPException(status_code=400, detail="exactly one SQL statement is required")
+
+    stmt = statements[0].stmt
+    if isinstance(stmt, SelectStmt):
+        # SELECT ... INTO creates a table and is not read-only.
+        if stmt.intoClause is not None:
+            raise HTTPException(status_code=403, detail="SELECT INTO is forbidden by read-only policy")
+        # A WITH clause can contain data-modifying CTEs; reject those recursively.
+        with_clause = stmt.withClause
+        if with_clause is not None:
+            for cte in with_clause.ctes or ():
+                cte_stmt = cte.ctequery
+                if not isinstance(cte_stmt, SelectStmt):
+                    raise HTTPException(status_code=403, detail="data-modifying CTEs are forbidden")
+                if cte_stmt.intoClause is not None:
+                    raise HTTPException(status_code=403, detail="SELECT INTO is forbidden by read-only policy")
+        return
+
+    if isinstance(stmt, ExplainStmt):
+        if not isinstance(stmt.query, SelectStmt):
+            raise HTTPException(status_code=403, detail="only EXPLAIN of SELECT is allowed")
+        if stmt.query.intoClause is not None:
+            raise HTTPException(status_code=403, detail="EXPLAIN of SELECT INTO is forbidden")
+        if any(option.defname.lower() == "analyze" for option in (stmt.options or ())):
+            raise HTTPException(status_code=403, detail="EXPLAIN ANALYZE is forbidden by read-only policy")
+        return
+
+    raise HTTPException(status_code=403, detail="only SELECT or EXPLAIN of SELECT is allowed")
+
+
 @app.post("/v1/ops/query")
 def query(req: dict[str, Any], *, api_key: str | None = Header(default=None, alias="X-API-Key")):
     if api_key != API_KEY:
@@ -132,22 +174,28 @@ def query(req: dict[str, Any], *, api_key: str | None = Header(default=None, ali
     sql = (req.get("sql") or "").strip()
     if not sql:
         raise HTTPException(status_code=400, detail="'sql' is required")
-    if not _READ_ONLY_RE.match(sql):
-        raise HTTPException(status_code=403, detail="read-only policy: only SELECT/EXPLAIN/CHECK allowed")
-    if re.search(r"\b(INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE|COPY|REPLACE|SET\s+.*=)\b", sql, re.IGNORECASE):
-        raise HTTPException(status_code=403, detail="write/mutation keywords are forbidden (read-only policy)")
+
+    # Parse and enforce policy before creating a connection or executing SQL.
+    _validate_read_only_sql(sql)
 
     try:
         with closing(_get_conn()) as conn:
+            # Enforce transaction-level read-only even if a future validator regresses.
+            conn.set_session(readonly=True, autocommit=False)
             with conn.cursor() as cur:
+                cur.execute("SET LOCAL statement_timeout = '5s'")
+                cur.execute("SET LOCAL default_transaction_read_only = on")
                 cur.execute(sql)
                 cols = [d[0] for d in cur.description] if cur.description else []
-                rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+                rows = [dict(zip(cols, row)) for row in cur.fetchall()] if cur.description else []
                 return {"rows": rows, "columns": cols, "row_count": len(rows), "warning": None}
     except psycopg2.errors.SyntaxError as exc:
-        raise HTTPException(status_code=400, detail=f"SQL syntax error: {exc}")
+        # Defense in depth: SQL syntax should already have been rejected by pglast.
+        raise HTTPException(status_code=400, detail="invalid SQL syntax") from exc
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"query failed: {exc}")
+        raise HTTPException(status_code=500, detail="query execution failed") from exc
 
 
 if __name__ == "__main__":

@@ -12,7 +12,9 @@
 --   rows were not tenant-isolated in their own right.
 --
 --   The fix makes audit_events tenant-scoped directly:
---     * audit_events gains a NOT NULL tenant_id column (see models.py).
+--     * audit_events gains a tenant_id column (see models.py); new writes carry
+--       the validated tenant. Historical unassigned rows remain NULL and hidden
+--       from tenant-scoped application roles rather than receiving invented owners.
 --     * PersistentAuditLogger sets tenant context before every write, and
 --       repositories.AuditEventRepository.record() populates tenant_id and
 --       fails loud if get_current_tenant() is NULL.
@@ -33,21 +35,19 @@
 -- WHAT THIS DOES
 --   1. Adds audit_events.tenant_id (TEXT), initially nullable.
 --   2. Backfills tenant_id from investigations for every row carrying an
---      investigation_id.
---   3. Rows that cannot be attributed (investigation_id IS NULL, or pointing at
---      a missing investigation) are counted and the migration ABORTS, so an
---      operator resolves orphan audit rows explicitly rather than have a tenant
---      silently invented for tamper-evident audit history.
---   4. Sets tenant_id NOT NULL and creates ix_audit_events_tenant_id (matching
---      models.py: tenant_id, index=True).
---   5. Re-applies the corrected, tenant-keyed audit_events_policy, identical to
---      rls.py::apply_rls_policies.
+--      investigation_id. The owning investigation is the authoritative source.
+--   3. Preserves legacy rows that have no investigation with tenant_id NULL.
+--      Their tenant cannot be proven from the stored record, so this migration
+--      deliberately does not invent an owner or delete/alter their audit data.
+--   4. Creates ix_audit_events_tenant_id (matching models.py: tenant_id, index=True).
+--   5. Re-applies the corrected, tenant-keyed audit_events_policy. Rows whose
+--      tenant_id remains NULL are invisible to tenant-scoped application roles.
 --
 -- SAFETY
---   Idempotent. Adds and backfills a column; performs no DELETE or TRUNCATE.
---   Runs in a single transaction -- if orphan rows remain it rolls back whole,
---   leaving the database exactly as before. Migrations 001-004 are untouched.
-
+--   Idempotent. Adds/backfills a nullable column and tightens RLS; performs no
+--   DELETE or TRUNCATE. Legacy unassigned rows remain preserved for privileged
+--   administrative review only. New application writes still require a tenant
+--   from the validated request context. Migrations 001-004 are untouched.
 BEGIN;
 
 -- 1. Add the column, nullable for now so existing rows survive the ALTER.
@@ -60,24 +60,9 @@ UPDATE public.audit_events a
  WHERE a.investigation_id = i.investigation_id
    AND a.tenant_id IS NULL;
 
--- 3. Fail loud on any row we could not attribute to a tenant. Audit history is
---    tamper-evident; we do not invent a tenant for it.
-DO $$
-DECLARE orphan_count BIGINT;
-BEGIN
-    SELECT count(*) INTO orphan_count
-      FROM public.audit_events
-     WHERE tenant_id IS NULL;
-
-    IF orphan_count > 0 THEN
-        RAISE EXCEPTION
-            'audit_events: % row(s) have no derivable tenant_id (investigation_id is NULL or points to a missing investigation). Resolve these rows explicitly before applying this migration; refusing to invent a tenant for audit history.',
-            orphan_count;
-    END IF;
-END $$;
-
--- 4. Enforce NOT NULL and index, matching models.py.
-ALTER TABLE public.audit_events ALTER COLUMN tenant_id SET NOT NULL;
+-- 3. Keep tenant_id nullable for historical rows whose ownership cannot be
+--    proven. The strict policy below makes those rows invisible to app tenants.
+-- 4. Index tenant lookups.
 CREATE INDEX IF NOT EXISTS ix_audit_events_tenant_id ON public.audit_events (tenant_id);
 
 -- 5. Corrected, tenant-keyed policy. Identical to rls.py::apply_rls_policies.

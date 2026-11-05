@@ -12,12 +12,11 @@ from safenestt.investigations.records import EvidenceRecord, FindingRecord, Inve
 from safenestt.investigations.store import (
     PersistentInvestigationStore,
     TenantIsolationError,
-    ensure_schema,
 )
 from safenestt.investigations.intelligence import build_dossier_intelligence
 from safenestt.model.registry import GeminiProvider, ModelProvider, OllamaProvider, OpenAICompatibleProvider, OpenRouterProvider
 from safenestt.security.encryption import is_encryption_enabled
-from safenestt.persistence.engine import get_engine
+from safenestt.persistence.engine import get_engine, create_engine
 from safenestt.persistence.readiness import check_readiness
 from safenestt.security.rate_limit import RateLimitService, RateLimitScope
 from safenestt.security.approval import ApprovalService
@@ -197,12 +196,19 @@ def get_api_context(request: Request) -> tuple[str, str]:
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database schema on startup."""
+    """Verify owner-managed schema; never run migrations as the app role."""
     try:
-        ensure_schema()
-        logger.info("Database schema initialized")
+        # Schema creation and RLS policy installation require the dedicated
+        # database owner. Normal API startup uses only the least-privilege app
+        # role, so it must verify migration state rather than attempt DDL.
+        engine = get_engine() or create_engine()
+        result = check_readiness(engine)
+        if result.ready:
+            logger.info("Database schema and tenant-isolation controls verified")
+        else:
+            logger.error("Database security readiness failed: %s", "; ".join(result.failures))
     except Exception as exc:
-        logger.warning("Could not initialize database schema: %s", exc)
+        logger.error("Database security readiness verification failed: %s", type(exc).__name__)
 
 
 @app.middleware("http")
