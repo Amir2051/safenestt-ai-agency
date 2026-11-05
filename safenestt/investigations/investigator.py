@@ -21,7 +21,7 @@ from safenestt.tools.dns import DNSAdapter
 from safenestt.tools.interface import ToolInterface
 from safenestt.tools.manifest import ToolManifest
 from safenestt.tools.registry import tool_registry
-from safenestt.investigations.indicators import classify_indicator
+from safenestt.investigations.indicators import chain_for_value, classify_indicator
 
 
 MAX_TOOL_CALLS = 5
@@ -78,6 +78,12 @@ def _parse_model_json(response: ModelResponse) -> dict[str, Any]:
     return {"plan": ["dns.lookup.lookup"], "findings": [{"claim": content[:240]}], "finished": True}
 
 
+def _chain_hint(indicators: dict[str, Any]) -> str | None:
+    """Chain for the crypto lane, from the wallet / tx shape (orchestrator defaults to eth)."""
+    value = indicators.get("wallet_address") or indicators.get("transaction_hash")
+    return chain_for_value(str(value)) if value else None
+
+
 def _case_context(target: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
     try:
         parsed = __import__("json").loads(target)
@@ -98,8 +104,14 @@ def _case_context(target: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
     for subject in intake.get("subjects") or []:
         for key in ("email", "phone", "ip_address", "website_social_media"):
             value = subject.get(key) if isinstance(subject, dict) else None
-            # Classify by shape: a "website" field can hold a wallet or an email.
+            if not value:
+                continue
+            # Classify by shape: a "website" field can hold a wallet, a social
+            # profile or an explorer link.
             classified = classify_indicator(value)
+            if classified is None and key != "website_social_media":
+                # Unrecognised shape in a typed field: keep it as before.
+                classified = (key, value)
             if classified and classified[0] not in indicators:
                 indicators[classified[0]] = classified[1]
     for transaction in intake.get("transactions") or []:
@@ -210,6 +222,9 @@ def run_investigation(
         "indicators": indicators,
         "case_context": case_context,
     }
+    chain_hint = _chain_hint(indicators)
+    if chain_hint:
+        orchestrator_inputs["chain"] = chain_hint
 
     try:
         orch_result = orchestrator.orchestrate(investigation_schema, orchestrator_inputs)
