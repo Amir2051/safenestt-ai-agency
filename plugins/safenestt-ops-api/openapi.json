@@ -1,0 +1,10 @@
+{
+  "openapi": "3.1.0",
+  "info": {"title": "SafeNestT Operations", "version": "v1", "description": "Read-only SafeNestT operations & observability queries."},
+  "servers": [{"url": "https://127.0.0.1:8321/v1", "description": "local"}],
+  "paths": {
+    "/health": {"get": {"summary": "Health", "responses": {"200": {"description": "OK"}}}},
+    "/ops/query": {"post": {"summary": "Read-only ops query", "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"sql": {"type": "string", "description": "A read-only SQL statement (SELECT/EXPLAIN ONLY). Must not contain INSERT/UPDATE/DELETE/DROP."}}}}}}},
+    "/ops/schema": {"get": {"summary": "Schema introspection", "responses": {"200": {"description": "Tables and columns"}}}}
+  }
+}

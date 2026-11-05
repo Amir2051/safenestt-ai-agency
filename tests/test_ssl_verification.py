@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import ssl
 import subprocess
+import sys
 import time
 
 import pytest
@@ -17,7 +18,17 @@ CA_CERT = os.path.join(CERTS_DIR, "ca.crt")
 # DB connection params
 DB_HOST = os.getenv("DB_HOST", "172.19.0.11")
 DB_PORT = os.getenv("DB_PORT", "5432")
-DB_NAME = os.getenv("DB_NAME", "safenestt_ai")
+# SECURITY FIX (2026-10-04): this defaulted to the PRODUCTION database
+# "safenestt_ai". Every psycopg2.connect() below would then target production.
+# The name is now resolved through the shared allowlist-validated guard, and
+# the connection-level guard installed by conftest re-checks each DSN.
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+
+import isolation_guard  # noqa: E402
+
+DB_NAME = isolation_guard.assert_test_db_configured()
 DB_USER = "safenestt_app"
 DB_PASSWORD = os.getenv("SAFENESTT_DB_PASSWORD", os.getenv("DB_PASSWORD", "safenestt_app_pass"))
 

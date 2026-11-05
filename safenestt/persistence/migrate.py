@@ -23,9 +23,18 @@ def main() -> int:
         Base.metadata.create_all(owner_engine)
         
         logger.info("Creating secure tenant context infrastructure...")
+        # Tenant context infrastructure (_tenant_context, the api_keys
+        # .key_fingerprint column, get_current_tenant, clear_tenant_context)
+        # is defined ONCE in rls.py::TENANT_CONTEXT_SQL and applied here, so
+        # migrate.py and ensure_schema() cannot drift apart. It previously
+        # lived only in this file, which meant ensure_schema() — the path the
+        # FastAPI app calls at startup — could not bootstrap a fresh database.
+        from safenestt.persistence.rls import ensure_tenant_context
+        ensure_tenant_context(owner_engine)
+
         with owner_engine.connect() as conn:
             from sqlalchemy import text
-            
+
             # Create safenestt_app role if missing
             result = conn.execute(
                 text("SELECT 1 FROM pg_roles WHERE rolname = 'safenestt_app'")
@@ -33,103 +42,59 @@ def main() -> int:
             if not result:
                 conn.execute(text("CREATE ROLE safenestt_app LOGIN PASSWORD 'safenestt_app_pass';"))
                 logger.info("  Created safenestt_app role")
-            
-            # Session-bound tenant context table
+
+            # The tenant context table must not be directly writable by the
+            # application role — only via the SECURITY DEFINER functions.
+            # Guarded on ownership: ensure_schema() may have created
+            # _tenant_context under the app role if it ran first, and a
+            # non-owner REVOKE raises "must be owner of table".
             conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS _tenant_context (
-                    backend_pid INTEGER PRIMARY KEY,
-                    tenant_id TEXT NOT NULL,
-                    key_fingerprint TEXT NOT NULL,
-                    established_at TIMESTAMP DEFAULT NOW(),
-                    expires_at TIMESTAMP NOT NULL DEFAULT NOW() + INTERVAL '1 hour'
-                );
-                CREATE INDEX IF NOT EXISTS idx_tenant_context_expires 
-                ON _tenant_context (expires_at);
-            """))
-            
-            # Revoke ALL from app role
-            conn.execute(text("REVOKE ALL ON _tenant_context FROM safenestt_app"))
-            conn.execute(text("REVOKE ALL ON _tenant_context FROM PUBLIC"))
-            
-            # Add key_fingerprint column to api_keys if it doesn't exist
-            conn.execute(text("""
-                DO $$ 
+                DO $$
                 BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1 FROM information_schema.columns 
-                        WHERE table_name = 'api_keys' AND column_name = 'key_fingerprint'
+                    IF EXISTS (
+                        -- CORRECTED (migration 004): this ownership test was false on
+                        -- every real run -- _tenant_context is created by the APPLICATION role
+                        -- via ensure_schema(), while the migration connects as the owner, so the
+                        -- REVOKE below was silently skipped while GRANT ... ON ALL TABLES above
+                        -- had already run. Revoking another role's grant does not require owning
+                        -- the table; guard only on existence. Idempotent.
+                        SELECT 1 FROM pg_class c
+                        WHERE c.relname = '_tenant_context'
+                          AND c.relnamespace = 'public'::regnamespace
                     ) THEN
-                        ALTER TABLE api_keys ADD COLUMN key_fingerprint TEXT;
+                        EXECUTE 'REVOKE INSERT, UPDATE, DELETE ON public._tenant_context FROM safenestt_app';
+                        EXECUTE 'REVOKE ALL ON public._tenant_context FROM PUBLIC';
                     END IF;
                 END $$;
             """))
-            
-            # SECURITY DEFINER: establish_tenant_context
-            conn.execute(text("""
-                CREATE OR REPLACE FUNCTION establish_tenant_context(
-                    p_tenant_id TEXT, 
-                    p_key_fingerprint TEXT
-                )
-                RETURNS TEXT AS $$
-                DECLARE
-                    v_count INTEGER;
-                BEGIN
-                    SET search_path = public;
-                    
-                    -- Verify that an active key exists with matching tenant_id AND fingerprint
-                    SELECT COUNT(*) INTO v_count
-                    FROM api_keys ak
-                    WHERE ak.key_fingerprint = p_key_fingerprint
-                    AND ak.tenant_id = p_tenant_id
-                    AND ak.active = TRUE
-                    AND ak.revoked = FALSE
-                    AND (ak.expires_at IS NULL OR ak.expires_at > NOW());
-                    
-                    IF v_count = 0 THEN
-                        RAISE EXCEPTION 'Invalid API key or tenant mismatch';
-                    END IF;
-                    
-                    -- Record context
-                    INSERT INTO _tenant_context (backend_pid, tenant_id, key_fingerprint, expires_at)
-                    VALUES (pg_backend_pid(), p_tenant_id, p_key_fingerprint, NOW() + INTERVAL '1 hour')
-                    ON CONFLICT (backend_pid) 
-                    DO UPDATE SET 
-                        tenant_id = EXCLUDED.tenant_id,
-                        key_fingerprint = EXCLUDED.key_fingerprint,
-                        established_at = NOW(),
-                        expires_at = NOW() + INTERVAL '1 hour';
-                    
-                    RETURN p_tenant_id;
-                END;
-                $$ LANGUAGE plpgsql SECURITY DEFINER;
-            """))
-            
-            conn.execute(text("""
-                CREATE OR REPLACE FUNCTION get_current_tenant()
-                RETURNS TEXT AS $$
-                DECLARE
-                    v_tenant_id TEXT;
-                BEGIN
-                    SET search_path = public;
-                    SELECT tc.tenant_id INTO v_tenant_id
-                    FROM _tenant_context tc
-                    WHERE tc.backend_pid = pg_backend_pid()
-                    AND tc.expires_at > NOW();
-                    RETURN COALESCE(v_tenant_id, '');
-                END;
-                $$ LANGUAGE plpgsql SECURITY DEFINER;
-            """))
-            
-            conn.execute(text("""
-                CREATE OR REPLACE FUNCTION clear_tenant_context()
-                RETURNS VOID AS $$
-                BEGIN
-                    SET search_path = public;
-                    DELETE FROM _tenant_context WHERE backend_pid = pg_backend_pid();
-                END;
-                $$ LANGUAGE plpgsql SECURITY DEFINER;
-            """))
-            
+
+            conn.commit()
+
+        with owner_engine.connect() as conn:
+            from sqlalchemy import text
+
+            # NOTE: the tenant functions are intentionally NOT redefined here.
+            #
+            # migrate.py previously carried its own copies of
+            # establish_tenant_context, get_current_tenant and
+            # clear_tenant_context, which conflicted with the authoritative
+            # definitions in rls.py:
+            #   * get_current_tenant / clear_tenant_context now come from
+            #     rls.py::TENANT_CONTEXT_SQL (applied just above), which
+            #     preserves an existing deployment's definitions instead of
+            #     overwriting them.
+            #   * establish_tenant_context is created by RLS_POLICY_SQL, whose
+            #     version additionally inspects the key's `revoked` and
+            #     `expires_at` values. The migrate.py copy did not, so running
+            #     migrate.main() AFTER a policy application silently replaced
+            #     the stricter function with the weaker one.
+            #
+            # Keeping a single definition removes that downgrade path.
+            #
+            # EXECUTE grants therefore happen LATER, after apply_rls_policies()
+            # has created establish_tenant_context. Granting on a function that
+            # does not exist yet fails with UndefinedFunction.
+
             # Drop old/insecure functions
             conn.execute(text("""
                 DROP FUNCTION IF EXISTS set_app_tenant_context(TEXT);
@@ -137,35 +102,113 @@ def main() -> int:
                 DROP FUNCTION IF EXISTS get_app_tenant_context();
                 DROP FUNCTION IF EXISTS check_cross_tenant_access(TEXT, TEXT);
             """))
-            
-            # Grant EXECUTE to app role
+
+            conn.commit()
+
+        logger.info("Applying RLS policies...")
+        # Creates establish_tenant_context as part of RLS_POLICY_SQL, after
+        # ensure_tenant_context() has already created get_current_tenant().
+        apply_rls_policies(owner_engine)
+
+        with owner_engine.connect() as conn:
+            from sqlalchemy import text
+
+            # Grant EXECUTE on the tenant functions to the app role, and keep
+            # them away from PUBLIC.
             conn.execute(text("GRANT EXECUTE ON FUNCTION establish_tenant_context(TEXT, TEXT) TO safenestt_app"))
             conn.execute(text("GRANT EXECUTE ON FUNCTION get_current_tenant() TO safenestt_app"))
             conn.execute(text("GRANT EXECUTE ON FUNCTION clear_tenant_context() TO safenestt_app"))
-            
             conn.execute(text("REVOKE ALL ON FUNCTION establish_tenant_context(TEXT, TEXT) FROM PUBLIC"))
             conn.execute(text("REVOKE ALL ON FUNCTION get_current_tenant() FROM PUBLIC"))
             conn.execute(text("REVOKE ALL ON FUNCTION clear_tenant_context() FROM PUBLIC"))
-            
+
             conn.commit()
-        
-        logger.info("Applying RLS policies...")
-        apply_rls_policies(owner_engine)
-        
+
         logger.info("Granting privileges to safenestt_app role...")
         with owner_engine.connect() as conn:
             conn.execute(text("GRANT USAGE ON SCHEMA public TO safenestt_app"))
             conn.execute(text("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO safenestt_app"))
             conn.execute(text("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO safenestt_app"))
-            conn.execute(text("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO safenestt_app"))
-            conn.execute(text("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO safenestt_app"))
+            # SECURITY: these used to be GRANT ALL, which produced the default ACL
+            # "safenestt_app=arwdDxtm" -- every future table would silently inherit
+            # INSERT/UPDATE/DELETE/TRUNCATE/TRIGGER. A newly created security-sensitive
+            # table would be writable by the application role by default.
+            # Restricted to SELECT; writes must be granted per table.
+            # REVOKE-then-GRANT so a broader default from a prior run is removed.
+            # Idempotent. Sequence behaviour (USAGE, SELECT) is preserved.
+            conn.execute(text("ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM safenestt_app"))
+            conn.execute(text("ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM safenestt_app"))
+            conn.execute(text("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO safenestt_app"))
+            conn.execute(text("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO safenestt_app"))
             
-            # Re-revoke access to _tenant_context
-            conn.execute(text("REVOKE ALL ON _tenant_context FROM safenestt_app"))
-            conn.execute(text("REVOKE ALL ON _tenant_context FROM PUBLIC"))
+            # --- SECURITY (004): _tenant_context privilege protections ----------
+            # This is the ONLY statement in this file that restores the privilege
+            # state enforced by migrations/004_rls_tenant_context_privileges.sql,
+            # which is NOT executed by any runner (migrate.py reads no .sql files).
+            # It must run AFTER the GRANT ... ON ALL TABLES above, which would
+            # otherwise re-grant write access to the tenant-binding table.
+            # Idempotent; guarded on table existence.
+            conn.execute(text("""
+            DO $$
+            DECLARE _r record;
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM pg_class c
+                    WHERE c.relname = '_tenant_context'
+                      AND c.relnamespace = 'public'::regnamespace
+                ) THEN
+                    EXECUTE 'REVOKE INSERT, UPDATE, DELETE ON public._tenant_context FROM safenestt_app';
+                    EXECUTE 'REVOKE ALL ON public._tenant_context FROM PUBLIC';
+                    FOR _r IN SELECT rolname FROM pg_roles WHERE rolname LIKE 'rls\_test\_%' LOOP
+                        EXECUTE format('REVOKE ALL ON public._tenant_context FROM %I', _r.rolname);
+                    END LOOP;
+                END IF;
+            END $$;
+            """))
+
+            # Re-revoke access to _tenant_context. The GRANT ... ON ALL TABLES above
+            # would otherwise hand the app role full access to it. Guarded on
+            # ownership for the same reason as the earlier REVOKE.
+            conn.execute(text("""
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        -- CORRECTED (migration 004): this ownership test was false on
+                        -- every real run -- _tenant_context is created by the APPLICATION role
+                        -- via ensure_schema(), while the migration connects as the owner, so the
+                        -- REVOKE below was silently skipped while GRANT ... ON ALL TABLES above
+                        -- had already run. Revoking another role's grant does not require owning
+                        -- the table; guard only on existence. Idempotent.
+                        SELECT 1 FROM pg_class c
+                        WHERE c.relname = '_tenant_context'
+                          AND c.relnamespace = 'public'::regnamespace
+                    ) THEN
+                        EXECUTE 'REVOKE INSERT, UPDATE, DELETE ON public._tenant_context FROM safenestt_app';
+                        EXECUTE 'REVOKE ALL ON public._tenant_context FROM PUBLIC';
+                    END IF;
+                END $$;
+            """))
             
             conn.commit()
         
+        logger.info("Writing migration-complete marker...")
+        # wait_for_migrate.py polls for this table to decide whether the API may
+        # start. It was never created, so the poll ALWAYS timed out (120s) and
+        # the compose `api` service — which gates uvicorn on it with `&&` —
+        # could never start. The marker is created only after every preceding
+        # step succeeded.
+        with owner_engine.connect() as conn:
+            from sqlalchemy import text as _text
+            conn.execute(_text("""
+                CREATE TABLE IF NOT EXISTS _migration_complete (
+                    completed_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    api_version TEXT
+                )
+            """))
+            conn.execute(_text(
+                "UPDATE _migration_complete SET completed_at = NOW()"))
+            conn.commit()
+
         logger.info("Migration complete.")
         return 0
         

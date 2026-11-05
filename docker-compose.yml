@@ -51,12 +51,27 @@ services:
   # Entrypoint script: waits for migrate to complete before starting API
   api:
     build: .
+    # Pre-start security gate, using the SAME implementation as systemd
+    # (ExecStartPre) and start-engine.sh: safenestt/persistence/startup_gate.py.
+    #
+    #   1. wait for postgres to accept connections
+    #   2. wait for the privileged `migrate` job to publish its marker
+    #   3. VERIFY the database security state (read-only, app credentials)
+    #   4. only then start uvicorn
+    #
+    # Step 3 is a pre-start gate, not a post-start probe: uvicorn is never
+    # exec'd while the security state is unverified, so no listening socket is
+    # opened on an unverified database.
     command: >
       sh -c "
-        echo 'Waiting for migration to complete...' &&
+        echo 'Waiting for postgres...' &&
         ! dockerize -wait tcp://postgres:5432 -timeout 60s 2>/dev/null &&
+        echo 'Waiting for migration to complete...' &&
         python -m safenestt.persistence.wait_for_migrate &&
-        uvicorn safenestt.api:app --host 0.0.0.0 --port 8000
+        echo 'Running pre-start security gate...' &&
+        python -m safenestt.persistence.startup_gate --verify &&
+        echo 'Security gate passed.' &&
+        uvicorn safenestt.api.app:app --host 0.0.0.0 --port 8000
       "
     environment:
       MODE: ${MODE:-production}
@@ -71,7 +86,17 @@ services:
       SAFENESTT_ENCRYPTION_KEY: ${SAFENESTT_ENCRYPTION_KEY:-}
       DB_SSL_MODE: verify-full
       DB_SSL_ROOT_CERT: /app/certs/ca.crt
-      # NO SAFENESTT_OWNER_PASSWORD — API runs as least-privilege role only
+      # NO SAFENESTT_OWNER_PASSWORD — API runs as least-privilege role only.
+      # /v1/ready is the traffic gate: it returns 503 until migrate has
+      # installed the required RLS state.
+    healthcheck:
+      # Readiness, not liveness: withhold traffic until the database security
+      # state is installed. /v1/health (liveness) stays independent.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/v1/ready').status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     volumes:
       - ./certs:/app/certs:ro
     ports:
