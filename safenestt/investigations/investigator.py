@@ -21,6 +21,7 @@ from safenestt.tools.dns import DNSAdapter
 from safenestt.tools.interface import ToolInterface
 from safenestt.tools.manifest import ToolManifest
 from safenestt.tools.registry import tool_registry
+from safenestt.investigations.indicators import classify_indicator
 
 
 MAX_TOOL_CALLS = 5
@@ -83,7 +84,11 @@ def _case_context(target: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
         if not isinstance(parsed, dict):
             raise ValueError
     except Exception:
-        return target, {"domain": target}, {}
+        # A bare target is classified by its shape. It used to be filed as a
+        # domain unconditionally, which sent wallets to DNS/Shodan lookups
+        # and kept them out of the crypto lane.
+        classified = classify_indicator(target)
+        return target, ({classified[0]: classified[1]} if classified else {}), {}
     indicators: dict[str, Any] = {}
     intake = parsed.get("intake") or {}
     complainant_email = intake.get("complainant_email")
@@ -91,10 +96,12 @@ def _case_context(target: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
     if complainant_email: indicators["email"] = complainant_email
     if complainant_phone: indicators["phone"] = complainant_phone
     for subject in intake.get("subjects") or []:
-        for key, indicator_key in (("email", "email"), ("phone", "phone"), ("ip_address", "ip_address"), ("website_social_media", "domain")):
+        for key in ("email", "phone", "ip_address", "website_social_media"):
             value = subject.get(key) if isinstance(subject, dict) else None
-            if value and indicator_key not in indicators:
-                indicators[indicator_key] = value
+            # Classify by shape: a "website" field can hold a wallet or an email.
+            classified = classify_indicator(value)
+            if classified and classified[0] not in indicators:
+                indicators[classified[0]] = classified[1]
     for transaction in intake.get("transactions") or []:
         if not isinstance(transaction, dict):
             continue
