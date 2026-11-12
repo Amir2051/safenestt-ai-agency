@@ -47,23 +47,29 @@ class InvestigationRecord:
         "VERIFYING",
         "CALCULATING_RISK",
         "COMPLETED",
+        "COMPLETED_WITH_ERRORS",
         "FAILED",
         "CANCELLED",
         "ANALYZING",
     }
     TRANSITIONS = {
         "QUEUED": {"RUNNING", "CANCELLED", "FAILED"},
-        "RUNNING": {"ANALYZING", "WAITING_FOR_TOOL", "VERIFYING", "FAILED", "CANCELLED"},
+        "RUNNING": {"ANALYZING", "WAITING_FOR_TOOL", "VERIFYING", "FAILED", "CANCELLED", "COMPLETED", "COMPLETED_WITH_ERRORS"},
         "ANALYZING": {"WAITING_FOR_TOOL", "FAILED", "CANCELLED"},
         "WAITING_FOR_TOOL": {"RUNNING", "VERIFYING", "FAILED", "CANCELLED"},
         "VERIFYING": {"CALCULATING_RISK", "FAILED", "CANCELLED"},
-        "CALCULATING_RISK": {"COMPLETED", "FAILED", "CANCELLED"},
+        "CALCULATING_RISK": {"COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED", "CANCELLED"},
+        # COMPLETED_WITH_ERRORS is terminal: the investigation produced real
+        # results but at least one critical persistence step failed. It is
+        # deliberately NOT the same as COMPLETED so operators and callers can
+        # detect an investigation that is missing its report or graph.
         "COMPLETED": set(),
+        "COMPLETED_WITH_ERRORS": set(),
         "FAILED": {"QUEUED"},
         "CANCELLED": {"QUEUED"},
     }
 
-    def __init__(self, investigation_id: str, tenant_id: str | None = None, created_by: str | None = None, target: str | None = None, type: str | None = None, status: str = "QUEUED", created_at: datetime | None = None, updated_at: datetime | None = None, error: dict[str, Any] | None = None) -> None:
+    def __init__(self, investigation_id: str, tenant_id: str | None = None, created_by: str | None = None, target: str | None = None, type: str | None = None, status: str = "QUEUED", created_at: datetime | None = None, updated_at: datetime | None = None, error: dict[str, Any] | None = None, case_id: str | None = None) -> None:
         self.investigation_id = investigation_id
         self.tenant_id = tenant_id
         self.created_by = created_by
@@ -73,6 +79,7 @@ class InvestigationRecord:
         self.created_at = created_at or datetime.utcnow()
         self.updated_at = updated_at or datetime.utcnow()
         self.error = error
+        self.case_id = case_id
 
     def mark(self, status: str) -> None:
         if status not in self.VALID_STATUSES:
@@ -92,5 +99,8 @@ class FindingRecord:
     evidence_ids: list[str] = field(default_factory=list)
     reality_status: str = "AI_INFERENCE"
     risk_score: float = 0.0
+    # Attribution. Defaulted so existing construction sites are unaffected; the
+    # persistence layer reads this via getattr(finding, "agent", None).
+    agent: str = ""
     factors: dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=datetime.utcnow)

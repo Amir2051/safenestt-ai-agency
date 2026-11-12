@@ -15,7 +15,13 @@ jobs:
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: testpass
-          POSTGRES_DB: safenestt_ai
+          # SAFETY (2026-10-04): this was `safenestt_ai` — the PRODUCTION
+          # database name. The service container is itself throwaway, but using
+          # the production name meant the CI job could not be distinguished
+          # from a real production run, and scripts/ci-safety-gate.sh (which
+          # refuses that name outright) would fail the job. It is now an
+          # explicitly-named test database.
+          POSTGRES_DB: safenestt_ai_test
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
@@ -37,12 +43,35 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
-      - name: Run tests
-        env:
-          DATABASE_URL: "postgresql://postgres:testpass@localhost:5432/safenestt_ai"
-          POSTGRES_PASSWORD: testpass
+      # -------------------------------------------------------------------
+      # SAFETY GATE — MUST run before pytest, and must not be bypassable.
+      #
+      # The gate is invoked with `--run`, so the pytest command lives INSIDE
+      # the gate invocation. That is deliberate: a later `python -m pytest`
+      # step would be a separate command that the gate never sees. Putting the
+      # test command behind the gate makes "run tests" and "verify not
+      # production" the same atomic action.
+      #
+      # The gate exits 2 on a production target, which fails the step and the
+      # job. `tests/conftest.py` independently aborts the session (via
+      # pytest.UsageError) if anything still points at production, so there are
+      # two independent barriers before a socket can be opened.
+      # -------------------------------------------------------------------
+      - name: Safety gate — refuse to run tests against production
         run: |
-          python -m pytest tests/ -v --tb=short --junitxml=test-results.xml
+          chmod +x scripts/ci-safety-gate.sh
+          scripts/ci-safety-gate.sh
+
+      - name: Run tests (gated — cannot reach production)
+        env:
+          DB_NAME: safenestt_ai_test
+          DATABASE_URL: "postgresql://postgres:***@localhost:5432/safenestt_ai_test"
+          SAFENESTT_DATABASE_URL: "postgresql://postgres:***@localhost:5432/safenestt_ai_test"
+          SAFENESTT_OWNER_DATABASE_URL: "postgresql://postgres:***@localhost:5432/safenestt_ai_test"
+          POSTGRES_PASSWORD: testpass
+          SAFENESTT_OWNER_PASSWORD: testpass
+        run: |
+          scripts/ci-safety-gate.sh --run python -m pytest tests/ -v --tb=short --junitxml=test-results.xml
 
       - name: Upload test results
         if: always()

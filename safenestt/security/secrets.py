@@ -23,25 +23,28 @@ logger = logging.getLogger(__name__)
 _cache: dict[str, str] = {}
 
 
-def get_secret(name: str, default: str | None = None, required: bool = False) -> str | None:
+def get_secret(name: str, default: str | None = None, required: bool = False, _timeout: float = 2.0) -> str | None:
     """Resolve a secret by name with caching.
-    
+
     Resolution order:
     1. Environment variable (highest priority)
     2. Docker secrets (/run/secrets/<name>)
-    3. AWS SSM Parameter Store (if AWS_REGION set)
-    4. Google Cloud Secret Manager (if GCP_PROJECT set)
+    3. AWS SSM Parameter Store (if AWS_REGION set) — bounded by _timeout
+    4. Google Cloud Secret Manager (if GCP_PROJECT set) — bounded by _timeout
     5. Default value
+
+    Cloud backend calls have a bounded timeout so unreachable metadata
+    services fail fast instead of hanging the request.
     """
     if name in _cache:
         return _cache[name]
-    
+
     # 1. Environment variable
     value = os.getenv(name)
     if value:
         _cache[name] = value
         return value
-    
+
     # 2. Docker secrets
     docker_secret_path = f"/run/secrets/{name.lower()}"
     if os.path.exists(docker_secret_path):
@@ -52,43 +55,62 @@ def get_secret(name: str, default: str | None = None, required: bool = False) ->
             return value
         except Exception as exc:
             logger.warning("Failed to read Docker secret %s: %s", name, exc)
-    
-    # 3. AWS SSM Parameter Store
+
+    # 3. AWS SSM Parameter Store — bounded
     aws_region = os.getenv("AWS_REGION")
     if aws_region:
         try:
             import boto3  # type: ignore[import-untyped]
-            ssm = boto3.client("ssm", region_name=aws_region)
+            from botocore.config import Config  # type: ignore[import-untyped]
+
+            ssm = boto3.client(
+                "ssm",
+                region_name=aws_region,
+                config=Config(
+                    connect_timeout=int(_timeout * 1000),
+                    read_timeout=int(_timeout * 1000),
+                    retries={"max_attempts": 1},
+                ),
+            )
             response = ssm.get_parameter(
                 Name=f"/safenestt/{os.getenv('ENV', 'production')}/{name}",
-                WithDecryption=True
+                WithDecryption=True,
             )
             value = response["Parameter"]["Value"]
             _cache[name] = value
             return value
         except Exception as exc:
             logger.debug("AWS SSM lookup failed for %s: %s", name, exc)
-    
-    # 4. Google Cloud Secret Manager
+
+    # 4. Google Cloud Secret Manager — bounded via thread executor
     gcp_project = os.getenv("GCP_PROJECT")
     if gcp_project:
         try:
             from google.cloud import secretmanager  # type: ignore[import-untyped]
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
             client = secretmanager.SecretManagerServiceClient()
             secret_path = f"projects/{gcp_project}/secrets/{name}/versions/latest"
-            response = client.access_secret_version(request={"name": secret_path})
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(client.access_secret_version, request={"name": secret_path})
+                try:
+                    response = future.result(timeout=_timeout)
+                except FuturesTimeout:
+                    logger.debug("GCP Secret Manager timeout for %s (>%ss)", name, _timeout)
+                    raise
             value = response.payload.data.decode("UTF-8")
             _cache[name] = value
             return value
         except Exception as exc:
             logger.debug("GCP Secret Manager lookup failed for %s: %s", name, exc)
-    
+
     if required and default is None:
         raise RuntimeError(
             f"Required secret '{name}' not found. "
             "Set environment variable, Docker secret, or configure KMS."
         )
-    
+
     return default
 
 

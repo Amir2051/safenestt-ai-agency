@@ -1,0 +1,121 @@
+-- ############################################################################
+-- # REJECTED — DO NOT EXECUTE. 2026-10-04.                                   #
+-- #                                                                          #
+-- # Decision: OPTION A — do not apply. Production privileges are UNCHANGED.  #
+-- # This file is retained ONLY as a record of what was proposed and why it   #
+-- # was rejected. It is documentation, not a runnable migration.             #
+-- #                                                                          #
+-- # REASON 1 — IT PROVIDES NO ADDITIONAL PROTECTION.                         #
+-- #   Verified against production on 2026-10-04:                             #
+-- #     * safenestt_app owns ZERO objects; postgres owns all 26.             #
+-- #     * DROP follows OWNERSHIP and is not a grantable privilege, so        #
+-- #       safenestt_app ALREADY cannot drop any production table.            #
+-- #   The header's premise — that revoking CREATE is what prevents the drop  #
+-- #   — was wrong. Ownership is the operative control, and it already holds. #
+-- #   Statement 1 (REVOKE CREATE FROM PUBLIC) is a NO-OP: PUBLIC already had #
+-- #   no CREATE on schema public, and there are zero PUBLIC table grants.    #
+-- #                                                                          #
+-- # REASON 2 — IT WOULD BREAK THE ENGINE STARTUP PATH.                       #
+-- #   safenestt-engine.service runs as DB_USER=safenestt_app, and           #
+-- #   safenestt/api/app.py:170 calls ensure_schema() on every startup, which #
+-- #   calls Base.metadata.create_all(engine) (store.py:626). That REQUIRES   #
+-- #   CREATE on schema public. Revoking it makes the next engine restart    #
+-- #   raise InsufficientPrivilege — which app.py:172 swallows with           #
+-- #   logger.warning. The engine would look HEALTHY while silently skipping  #
+-- #   schema bootstrap. On a fresh database that means no tables at all.    #
+-- #   The original header claimed "the application continues to work         #
+-- #   unchanged"; that was incorrect.                                        #
+-- #                                                                          #
+-- # REASON 3 — INACCURATE DOCUMENTATION.                                    #
+-- #   The header claimed it revokes TRUNCATE and ALL ON SCHEMA FROM PUBLIC.  #
+-- #   Neither statement exists in the file.                                 #
+-- #                                                                          #
+-- # ACTUAL BARRIERS protecting production (these are the real controls):     #
+-- #   1. tests/isolation_guard.py  — refuses production DSNs at the          #
+-- #      connection boundary (psycopg2.connect, sqlalchemy.create_engine).   #
+-- #   2. scripts/ci-safety-gate.sh — refuses to run tests when DB_NAME or    #
+-- #      any *_DATABASE_URL names production.                                #
+-- #   3. Port isolation — tests run against a DEDICATE test PostgreSQL       #
+-- #      instance on 127.0.0.1:55432, physically separate from              #
+-- #      production's 54322 (docker-compose.test-db.yml).                   #
+-- #   4. Database ownership — postgres owns every production object, so the #
+-- #      application role cannot drop or alter schema.                       #
+-- #   5. RLS ENABLE+FORCE on all 8 tenant tables, verified 8/8.             #
+-- # ############################################################################
+--
+-- (Original intent, retained for the record: make it impossible for the
+-- ordinary application / test role to DROP production tables, even if
+-- application-level guards are bypassed or misconfigured.)
+--
+-- Why this is a separate, stronger barrier than the Python guard:
+--   tests/conftest.py + tests/isolation_guard.py prevent the *application* from
+--   issuing a bad DSN. They cannot help when a test connects as `postgres`,
+--   which is what tests/test_persistence.py does (OWNER_URL uses the postgres
+--   role precisely because the app role cannot run DDL). Database privileges
+--   are the only control that survives that.
+--
+-- WHAT THIS CHANGES
+--   1. Revokes CREATE on schema public from PUBLIC and from safenestt_app.
+--      Without CREATE, a role cannot create objects, and `DROP TABLE` on a table
+--      it does not own is denied.
+--   2. Revokes TRUNCATE on all production tables from safenestt_app.
+--   3. Revokes ALL on the production schema from PUBLIC.
+--
+-- WHAT THIS DOES NOT CHANGE
+--   * Ownership. `postgres` remains the owner and retains full rights — the
+--     application and the migration path continue to work unchanged.
+--   * No rows are deleted. No table is dropped. No data is touched.
+--   * No role is created or dropped.
+--
+-- VERIFICATION (read-only, run after applying)
+--   SELECT has_table_privilege('safenestt_app','investigations','DROP');
+--   -> expect false
+--
+-- ROLLBACK
+--   REVOKE is cumulative; to undo, re-GRANT the specific privileges.
+--   The exact inverse statements are listed at the bottom.
+--
+-- IMPORTANT CAVEAT
+--   tests/ currently connect as `postgres` to run DDL against the TEST
+--   database. This script does NOT change that. It only removes privileges
+--   from `safenestt_app` and PUBLIC in the PRODUCTION database. If the
+--   production owner role is later changed, revisit.
+-- ============================================================================
+
+\echo '--- hardening production database: safenestt_ai ---'
+
+-- REJECTED-DO-NOT-EXECUTE BEGIN;
+
+-- 1. PUBLIC must not be able to create objects in this schema.
+--    CREATE is the prerequisite for owning a table, and owning a table is the
+--    prerequisite for dropping it.
+-- REJECTED-DO-NOT-EXECUTE REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+
+-- 2. The application role gets no DDL privileges at all.
+--    The engine runs as this role and only ever needs DML.
+-- REJECTED-DO-NOT-EXECUTE REVOKE CREATE ON SCHEMA public FROM safenestt_app;
+-- REJECTED-DO-NOT-EXECUTE REVOKE ALL ON ALL TABLES IN SCHEMA public FROM safenestt_app;
+-- REJECTED-DO-NOT-EXECUTE GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO safenestt_app;
+-- REJECTED-DO-NOT-EXECUTE GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO safenestt_app;
+
+-- 3. Default privileges, so tables created later inherit the same posture.
+-- REJECTED-DO-NOT-EXECUTE ALTER DEFAULT PRIVILEGES IN SCHEMA public
+-- REJECTED-DO-NOT-EXECUTE     REVOKE ALL ON TABLES FROM PUBLIC;
+-- REJECTED-DO-NOT-EXECUTE ALTER DEFAULT PRIVILEGES IN SCHEMA public
+-- REJECTED-DO-NOT-EXECUTE     REVOKE ALL ON TABLES FROM safenestt_app;
+-- REJECTED-DO-NOT-EXECUTE ALTER DEFAULT PRIVILEGES IN SCHEMA public
+-- REJECTED-DO-NOT-EXECUTE     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO safenestt_app;
+-- REJECTED-DO-NOT-EXECUTE ALTER DEFAULT PRIVILEGES IN SCHEMA public
+-- REJECTED-DO-NOT-EXECUTE     GRANT USAGE, SELECT ON SEQUENCES TO safenestt_app;
+
+-- REJECTED-DO-NOT-EXECUTE COMMIT;
+
+\echo '--- done; verify with has_table_privilege ---'
+
+-- ============================================================================
+-- ROLLBACK (inverse statements; do not run unless reverting)
+-- ============================================================================
+-- GRANT CREATE ON SCHEMA public TO PUBLIC;
+-- GRANT CREATE ON SCHEMA public TO safenestt_app;
+-- GRANT ALL ON ALL TABLES IN SCHEMA public TO safenestt_app;
+-- ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO safenestt_app;
