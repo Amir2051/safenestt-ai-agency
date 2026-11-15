@@ -63,7 +63,8 @@ class InvestigationRecord:
         # results but at least one critical persistence step failed. It is
         # deliberately NOT the same as COMPLETED so operators and callers can
         # detect an investigation that is missing its report or graph.
-        "COMPLETED": set(),
+        # COMPLETED is also requeueable: a terminal run is not a terminal case.
+        "COMPLETED": {"QUEUED"},
         "COMPLETED_WITH_ERRORS": set(),
         "FAILED": {"QUEUED"},
         "CANCELLED": {"QUEUED"},

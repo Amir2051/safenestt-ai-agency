@@ -77,6 +77,12 @@ class InvestigationCreateRequest(BaseModel):
     case_id: str | None = None
 
 
+class InvestigationRerunRequest(BaseModel):
+    target: dict[str, Any] | None = None
+    targets: list[dict[str, Any]] | None = None
+    narrative: str | None = None
+
+
 class InvestigationStartResponse(BaseModel):
     investigation_id: str
     status: str
@@ -308,6 +314,7 @@ def create_investigation(
 def start_investigation(
     investigation_id: str,
     request: Request,
+    rerun: InvestigationRerunRequest | None = None,
     api_context: tuple = Depends(get_api_context),
 ) -> dict[str, Any]:
     tenant_id, key_fingerprint = api_context
@@ -320,6 +327,26 @@ def start_investigation(
         raise _handle_tenant_isolation(exc)
     if not record:
         raise _to_api_error("not_found", "investigation_not_found", 404)
+
+    # A SafeNestT case may be investigated repeatedly. COMPLETED/FAILED/
+    # CANCELLED are terminal *runs*, not terminal cases. Requeue the same
+    # investigation id for a direct API rerun, optionally accepting refreshed
+    # case/target context from the caller.
+    if record.status in {"COMPLETED", "FAILED", "CANCELLED"}:
+        refreshed_target = rerun.target if rerun else None
+        refreshed_targets = rerun.targets if rerun else None
+        narrative = rerun.narrative if rerun else None
+        if refreshed_target or refreshed_targets or narrative:
+            import json
+            record.target = json.dumps({
+                "target": refreshed_target or {"type": "narrative", "value": record.target or "investigation"},
+                "targets": refreshed_targets or [],
+                "narrative": narrative,
+            })
+        record.error = None
+        record.mark("QUEUED")
+        record = service.update_investigation(record)
+
     if record.status != "QUEUED":
         raise _to_api_error("invalid_state", f"investigation_already_{record.status.lower()}", 409)
 

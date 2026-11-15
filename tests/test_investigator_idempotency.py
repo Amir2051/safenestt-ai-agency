@@ -5,6 +5,7 @@ import time
 from fastapi.testclient import TestClient
 
 from safenestt.api.app import app
+from safenestt.investigations.records import InvestigationRecord
 from safenestt.security.api_keys import get_key_store
 
 
@@ -18,60 +19,70 @@ def _register_key(tenant_id: str, raw_key: str) -> str:
     return raw
 
 
-def test_failed_investigation_can_be_rerun() -> None:
-    """A FAILED investigation can be rerun (transition FAILED → QUEUED → RUNNING)."""
-    client = _make_client()
-    raw_key = _register_key("org-1", "test-failed-reenlist-12345")
+def _wait_for_status(
+    client: TestClient,
+    investigation_id: str,
+    raw_key: str,
+    expected: set[str],
+) -> str:
+    status = ""
+    for _ in range(20):
+        time.sleep(2)
+        resp = client.get(
+            f"/v1/investigations/{investigation_id}",
+            headers={"X-API-Key": raw_key},
+        )
+        if resp.status_code == 200:
+            status = resp.json().get("status", "")
+            if status in expected:
+                break
+    return status
 
-    create = client.post("/v1/investigations", json={
-        "target": {"type": "domain", "value": "example.com"},
-        "investigation_type": "cybersecurity",
-    }, headers={"X-API-Key": raw_key})
+
+def test_completed_investigation_can_be_rerun() -> None:
+    """A terminal investigation run can be requeued for another run."""
+    client = _make_client()
+    raw_key = _register_key("org-1", "test-completed-rerun-12345")
+
+    create = client.post(
+        "/v1/investigations",
+        json={
+            "target": {"type": "domain", "value": "example.com"},
+            "investigation_type": "cybersecurity",
+        },
+        headers={"X-API-Key": raw_key},
+    )
     assert create.status_code == 200, f"create failed: {create.status_code}"
     investigation_id = create.json()["investigation_id"]
 
-    # Start the investigation
-    first = client.post(f"/v1/investigations/{investigation_id}/start", headers={"X-API-Key": raw_key})
-    assert first.status_code == 200
-    assert first.json()["investigation_id"] == investigation_id
-
-    # Wait for it to reach terminal state
-    for _ in range(20):
-        time.sleep(2)
-        status_resp = client.get(f"/v1/investigations/{investigation_id}", headers={"X-API-Key": raw_key})
-        if status_resp.status_code == 200:
-            status = status_resp.json().get("status", "")
-            if status in {"COMPLETED", "FAILED"}:
-                break
-
-    # Now try to start again — should get 409 (already terminal)
-    second = client.post(f"/v1/investigations/{investigation_id}/start", headers={"X-API-Key": raw_key})
-    assert second.status_code == 409
-    assert second.json()["detail"]["code"] == "invalid_state"
-
-
-def test_completed_investigation_blocks_duplicate_start() -> None:
-    """A COMPLETED investigation cannot be started again."""
-    client = _make_client()
-    raw_key = _register_key("org-1", "test-completed-block-12345")
-
-    create = client.post("/v1/investigations", json={
-        "target": {"type": "domain", "value": "example.com"},
-        "investigation_type": "cybersecurity",
-    }, headers={"X-API-Key": raw_key})
-    assert create.status_code == 200
-    investigation_id = create.json()["investigation_id"]
-
-    # Start and wait for COMPLETED
-    first = client.post(f"/v1/investigations/{investigation_id}/start", headers={"X-API-Key": raw_key})
+    first = client.post(
+        f"/v1/investigations/{investigation_id}/start",
+        headers={"X-API-Key": raw_key},
+    )
     assert first.status_code == 200
 
-    for _ in range(20):
-        time.sleep(2)
-        status_resp = client.get(f"/v1/investigations/{investigation_id}", headers={"X-API-Key": raw_key})
-        if status_resp.status_code == 200 and status_resp.json().get("status") == "COMPLETED":
-            break
+    status = _wait_for_status(
+        client, investigation_id, raw_key, {"COMPLETED", "FAILED"}
+    )
+    assert status in {"COMPLETED", "FAILED"}, f"unexpected terminal status: {status}"
 
-    # Duplicate start should be rejected
-    second = client.post(f"/v1/investigations/{investigation_id}/start", headers={"X-API-Key": raw_key})
-    assert second.status_code == 409
+    second = client.post(
+        f"/v1/investigations/{investigation_id}/start",
+        headers={"X-API-Key": raw_key},
+        json={
+            "target": {"type": "domain", "value": "example.org"},
+            "targets": [{"type": "domain", "value": "example.org"}],
+            "narrative": "Updated case information",
+        },
+    )
+    assert second.status_code == 200
+    assert second.json()["investigation_id"] == investigation_id
+
+
+def test_completed_state_allows_requeue() -> None:
+    """The state machine permits terminal runs to be requeued."""
+    transitions = InvestigationRecord.TRANSITIONS
+    assert "QUEUED" in transitions["COMPLETED"]
+    assert "QUEUED" in transitions["FAILED"]
+    assert "QUEUED" in transitions["CANCELLED"]
+    assert "QUEUED" not in transitions["COMPLETED_WITH_ERRORS"]
