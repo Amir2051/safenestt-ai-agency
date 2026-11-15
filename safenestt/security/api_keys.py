@@ -33,7 +33,7 @@ _API_KEY_PEPPER = os.getenv("API_KEY_PEPPER", "safenestt-pepper-change-in-produc
 # Import argon2 at module level
 try:
     from argon2 import PasswordHasher
-    from argon2.exceptions import VerifyMismatchError
+    from argon2.exceptions import VerifyMismatchError, InvalidHashError
     _PH = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=4, hash_len=32, salt_len=16)
     _ARGON2_AVAILABLE = True
 except ImportError:
@@ -61,7 +61,7 @@ def _verify_key(key: str, key_hash: str) -> bool:
     if _ARGON2_AVAILABLE:
         try:
             return _PH.verify(key_hash, f"{_API_KEY_PEPPER}:{key}")
-        except VerifyMismatchError:
+        except (VerifyMismatchError, InvalidHashError):
             return False
     else:
         salt = os.getenv("API_KEY_SALT", "safenestt-salt")
@@ -187,21 +187,27 @@ class APIKeyStore:
     
     def validate_key(self, raw_key: str, actor: str | None = None) -> tuple[bool, str, str, dict[str, Any]]:
         """Validate an API key. Returns (is_valid, tenant_id, key_fingerprint, metadata).
-        
+
+        Uses fingerprint-based lookup for O(1) candidate selection, then verifies
+        only the matching candidate with constant-time Argon2id. This avoids
+        expensive Argon2 verification on every key in the database.
+
         Records audit events for both successful and failed validations.
-        Checks ALL keys so revoked keys return key_revoked error.
-        Uses constant-time Argon2id verification.
+        Checks key status (revoked/expired/inactive) after verification.
         """
+        fingerprint = _compute_key_fingerprint(raw_key)
         with _api_key_session() as session:
             now = datetime.now(UTC)
-            all_keys = session.query(APIKeyModel).all()
-            
-            for key_record in all_keys:
+            candidates = session.query(APIKeyModel).filter(
+                APIKeyModel.key_fingerprint == fingerprint,
+            ).all()
+
+            for key_record in candidates:
                 if _verify_key(raw_key, key_record.key_hash):
                     if key_record.revoked:
                         _record_audit(session, key_record.id, "validate_revoked", actor)
                         return False, "", "", {"error": "key_revoked"}
-                    
+
                     if key_record.expires_at:
                         try:
                             expires_at = key_record.expires_at
@@ -214,27 +220,25 @@ class APIKeyStore:
                         except (ValueError, TypeError):
                             _record_audit(session, key_record.id, "validate_invalid_expiry", actor)
                             return False, "", "", {"error": "key_expired"}
-                    
+
                     if not key_record.active:
                         _record_audit(session, key_record.id, "validate_inactive", actor)
                         return False, "", "", {"error": "key_inactive"}
-                    
-                    fingerprint = _compute_key_fingerprint(raw_key)
-                    
+
                     key_record.last_used_at = now
                     key_record.use_count = (key_record.use_count or 0) + 1
-                    
+
                     _record_audit(session, key_record.id, "validate_success", actor)
                     session.flush()
-                    
+
                     return True, key_record.tenant_id, fingerprint, {
                         "name": key_record.name,
                         "scopes": key_record.scopes or [],
                         "created_at": key_record.created_at,
                         "expires_at": key_record.expires_at,
                     }
-            
-            # Don't record audit for not_found (no valid key_id)
+
+            # No fingerprint match — key not found. Don't record audit (no valid key_id).
             return False, "", "", {"error": "key_not_found"}
     
     def rotate_key(self, old_raw_key: str, tenant_id: str, actor: str | None = None) -> tuple[str, str, str]:

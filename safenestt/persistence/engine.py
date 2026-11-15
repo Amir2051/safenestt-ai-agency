@@ -61,6 +61,9 @@ def _build_engine(url: str, **kwargs) -> Engine:
             connect_args["sslcert"] = os.getenv("DB_SSL_CLIENT_CERT")
         if os.getenv("DB_SSL_CLIENT_KEY"):
             connect_args["sslkey"] = os.getenv("DB_SSL_CLIENT_KEY")
+        # connect_timeout: fail fast on unreachable DB instead of libpq default
+        # (10-30s for non-routable). Tests use DB_CONNECT_TIMEOUT.
+        connect_args["connect_timeout"] = int(os.getenv("DB_CONNECT_TIMEOUT", "5"))
     
     return _create_engine(url, connect_args=connect_args, **kwargs)
 

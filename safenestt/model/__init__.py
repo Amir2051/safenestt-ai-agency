@@ -11,6 +11,7 @@ from safenestt.model.registry import (
     ModelRegistry,
     MockModelProvider,
     OpenAICompatibleProvider,
+    OpenRouterProvider,
     OllamaProvider,
     model_registry,
 )

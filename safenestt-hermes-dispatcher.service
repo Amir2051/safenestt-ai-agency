@@ -1,0 +1,91 @@
+[Unit]
+Description=SafeNestT Hermes Investigation Queue Dispatcher
+Documentation=file:///home/ronzoro/safenestt-ai/safenestt/queue/dispatcher.py
+# The dispatcher reads and writes RLS-protected tables, so the database must be
+# up AND migrated before it starts. The previous engine unit ordered only
+# against network.target, which made it lose four start races at boot.
+After=network-online.target docker.service safenestt-engine.service
+Wants=network-online.target
+Requires=safenestt-engine.service
+
+# Restart-loop budget.
+# These MUST live in [Unit], not [Service]: systemd silently ignores
+# StartLimitIntervalSec/StartLimitBurst there. That was the bug — the
+# directives were previously in [Service] and had NO effect, so the
+# default limit (5 failures / 10s) applied. A transient database
+# outage at boot could exhaust that budget and leave the service
+# DOWN indefinitely.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=ronzoro
+WorkingDirectory=/home/ronzoro/safenestt-ai
+
+# Same least-privilege role as the engine. No owner credentials, no BYPASSRLS.
+EnvironmentFile=/etc/safenestt/engine.env
+Environment=MODE=development
+Environment=DB_SSL_MODE=disable
+Environment=DISPATCHER_POLL_SECONDS=5
+Environment=DISPATCHER_MAX_CONCURRENT=1
+Environment=DISPATCHER_STALE_AFTER_SECONDS=3600
+Environment=DISPATCHER_MAX_ATTEMPTS=3
+Environment=DISPATCHER_LOG_LEVEL=INFO
+
+# ---------------------------------------------------------------------
+# MODEL PROVIDER — REQUIRED, NOT OPTIONAL (added 2026-10-04)
+#
+# The dispatcher calls _resolve_model_provider() (dispatcher.py:245), which
+# reads os.getenv("MODEL_PROVIDER", ""). systemd `Environment=` directives are
+# PER-UNIT — they are NOT inherited from safenestt-engine.service. This unit
+# previously declared none, so under systemd the dispatcher would have resolved
+# an EMPTY provider and fallen back to Ollama/qwen3:1.7b, which takes 60s+ per
+# call on CPU and is what produced the earlier FAILED investigation
+# ("Cannot transition from RUNNING to COMPLETED_WITH_ERRORS").
+#
+# These MUST mirror safenestt-engine.service exactly, or the dispatcher and the
+# engine will disagree about which model an investigation used.
+#
+# The API key itself is NOT here — it lives only in /etc/safenestt/engine.env
+# (OPENROUTER_API_KEY) and must never be committed to this git-tracked file.
+# ---------------------------------------------------------------------
+Environment=MODEL_PROVIDER=openrouter
+Environment=OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+Environment=OPENROUTER_MODEL=nvidia/nemotron-3.5-lightning:free
+Environment=MODEL_NAME=nvidia/nemotron-3.5-lightning:free
+
+# Fail fast and loudly if the secret is missing, rather than silently running a
+# broken provider for hours. install-production-units.sh adds OPENROUTER_API_KEY
+# to engine.env; this assertion catches the case where it did not.
+ExecStartPre=/home/ronzoro/safenestt-ai/scripts/wait-for-postgres.sh 127.0.0.1 54322 60
+
+ExecStart=/home/ronzoro/safenestt-platform/apps/api/.venv/bin/python3 \
+    -m safenestt.queue.dispatcher
+
+# Queue work must survive a crash. `always` (not on-failure) so an unexpected
+# clean exit is also restarted — a dispatcher that exited quietly would leave
+# the queue stalled with no signal.
+Restart=always
+RestartSec=5
+
+
+# Graceful shutdown: SIGTERM sets the stop flag so the current investigation
+# finishes its DB commit instead of being killed mid-transaction.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+StandardOutput=append:/var/log/safenestt/dispatcher.log
+StandardError=append:/var/log/safenestt/dispatcher.log
+
+# Security hardening — mirrors the engine unit.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/log/safenestt
+PrivateTmp=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
