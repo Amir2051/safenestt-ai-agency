@@ -1,10 +1,18 @@
-# SafeNestT AI Engine
+# SafeNestT SENTRA — Agentic Investigation Intelligence
 
-Multi-agent investigation platform for fraud recovery, OSINT, and cybersecurity.
+SafeNestT's proprietary agentic investigation intelligence engine for fraud, OSINT, cybersecurity, digital intelligence, evidence analysis, and investigative reporting.
+
+**SENTRA** is the customer-facing name of the AI engine formerly referred to internally as Hermes.
 
 ## Architecture
 
-- **6 AI Agents**: Osint, ThreatIntel, Crypto, Evidence, FraudAnalysis, Report
+- **SENTRA Orchestrator**: coordinates the investigation
+- **SENTRA OSINT Investigator**
+- **SENTRA Security Intelligence Investigator**
+- **SENTRA Crypto Intelligence Investigator**
+- **SENTRA Evidence Investigator**
+- **SENTRA Fraud Investigator**
+- **SENTRA Intelligence Report Generator**
 - **Orchestrator**: Multi-agent investigation pipeline
 - **API**: FastAPI REST endpoints
 - **Persistence**: PostgreSQL with Row-Level Security (RLS)

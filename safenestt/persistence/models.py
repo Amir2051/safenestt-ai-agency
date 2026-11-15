@@ -160,6 +160,7 @@ class AuditEventModel(Base):
 
     id = mapped_column(Integer, primary_key=True)
     event_id = mapped_column(Text, unique=True, nullable=False, index=True)
+    tenant_id = mapped_column(Text, nullable=False, index=True)
     investigation_id = mapped_column(Text, ForeignKey("investigations.investigation_id"), nullable=True, index=True)
     actor_type = mapped_column(Text, nullable=False)
     actor_id = mapped_column(Text, nullable=True)
@@ -237,4 +238,91 @@ class RateLimitModel(Base):
     __table_args__ = (
         Index("ix_rate_limits_scope_key", "scope", "key", unique=True),
         Index("ix_rate_limits_reset", "reset_at"),
+    )
+
+
+class ApprovalModel(Base):
+    """PostgreSQL-backed approval records."""
+    __tablename__ = "approvals"
+
+    id = mapped_column(Integer, primary_key=True)
+    approval_id = mapped_column(Text, unique=True, nullable=False, index=True)
+    agent_id = mapped_column(Text, nullable=False, index=True)
+    tool_id = mapped_column(Text, nullable=False)
+    action = mapped_column(Text, nullable=False)
+    requested_capability = mapped_column(Text, nullable=False)
+    risk_level = mapped_column(Text, nullable=False, default="LOW")
+    requester_context = mapped_column(JSON, nullable=True)
+    created_at = mapped_column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    expiration_at = mapped_column(DateTime, nullable=True)
+    decision_at = mapped_column(DateTime, nullable=True)
+    approver_identity = mapped_column(Text, nullable=True)
+    status = mapped_column(Text, nullable=False, default="pending")
+    redacted_metadata = mapped_column(JSON, nullable=True)
+    tenant_id = mapped_column(Text, nullable=True, index=True)
+
+    __table_args__ = (
+        Index("ix_approvals_tenant_status", "tenant_id", "status"),
+        Index("ix_approvals_agent_status", "agent_id", "status"),
+    )
+
+
+class GraphNodeModel(Base):
+    """Authoritative investigation graph nodes.
+
+    Populated by the Hermes investigation engine via store.add_graph_node().
+    Each node belongs to exactly one investigation (via investigation_id FK).
+    case_id links to the originating Base44 case for cross-system reference.
+    This is the authoritative SENTRA graph; Base44 GraphNode entities are a
+    derived presentation copy rebuilt from Hermes results.
+    """
+    __tablename__ = "graph_nodes"
+
+    id = mapped_column(Integer, primary_key=True)
+    investigation_id = mapped_column(Text, ForeignKey("investigations.investigation_id"), nullable=False, index=True)
+    case_id = mapped_column(Text, nullable=True, index=True)
+    node_key = mapped_column(Text, nullable=False)
+    node_type = mapped_column(Text, nullable=False)  # entity | evidence | finding
+    node_label = mapped_column(Text, nullable=False, default="")
+    node_data = mapped_column(JSON, nullable=False, default=dict)
+    source = mapped_column(Text, nullable=False, default="hermes")
+    provenance = mapped_column(Text, nullable=False, default="")
+    created_at = mapped_column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    updated_at = mapped_column(DateTime, nullable=False, default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC))
+
+    __table_args__ = (
+        Index("uq_graph_nodes_inv_key", "investigation_id", "node_key", unique=True),
+        Index("ix_graph_nodes_node_type", "node_type"),
+    )
+
+
+class GraphEdgeModel(Base):
+    """Authoritative investigation graph edges.
+
+    Connects graph_nodes within the same investigation.
+    source_node_id and target_node_id are FKs to graph_nodes(id).
+    The same-investigation constraint is enforced at the application level
+    (store.add_graph_edge validates both nodes belong to the same investigation).
+    This is the authoritative SENTRA graph; Base44 GraphEdge entities are a
+    derived presentation copy rebuilt from Hermes results.
+    """
+    __tablename__ = "graph_edges"
+
+    id = mapped_column(Integer, primary_key=True)
+    investigation_id = mapped_column(Text, ForeignKey("investigations.investigation_id"), nullable=False, index=True)
+    case_id = mapped_column(Text, nullable=True, index=True)
+    edge_key = mapped_column(Text, nullable=False)
+    source_node_id = mapped_column(Text, nullable=False, index=True)
+    target_node_id = mapped_column(Text, nullable=False, index=True)
+    edge_type = mapped_column(Text, nullable=False)  # about | supports | supported_by
+    edge_label = mapped_column(Text, nullable=False, default="")
+    edge_data = mapped_column(JSON, nullable=False, default=dict)
+    source = mapped_column(Text, nullable=False, default="hermes")
+    provenance = mapped_column(Text, nullable=False, default="")
+    created_at = mapped_column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    updated_at = mapped_column(DateTime, nullable=False, default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC))
+
+    __table_args__ = (
+        Index("uq_graph_edges_inv_key", "investigation_id", "edge_key", unique=True),
+        Index("ix_graph_edges_edge_type", "edge_type"),
     )
